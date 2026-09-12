@@ -9,6 +9,7 @@
 #include <bom/bom.h>
 #include <bom/bom_format.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -61,31 +62,55 @@ bom_tree_alloc_empty(struct bom_context *context, const char *variable_name)
         return NULL;
     }
 
+    /*
+     * Real Apple BOM-tree readers (CoreUI's own private BOM/BOMStream
+     * implementation) treat each leaf/page as a FIXED-SIZE block of
+     * exactly node_size bytes -- confirmed empirically: assetutil rejects
+     * an entry block registered with a length smaller than the tree's own
+     * declared node_size ("BOMStreamGetDataPointer buffer overflow"), even
+     * when the leaf is otherwise well-formed and simply under-populated.
+     * The node_size value below (4096) was already being written into the
+     * tree header (see tree->node_size below); the entry/leaf block itself
+     * must actually BE that size from the start, not grow into it lazily
+     * via bom_index_append() as entries are added one at a time.
+     *
+     * This does not implement real B+-tree page splitting: a single leaf
+     * that grows past node_size's own key capacity (empirically ~510
+     * entries for node_size=4096, i.e. more entries than
+     * (node_size - sizeof(bom_tree_entry)) / sizeof(bom_tree_entry_indexes))
+     * still fails against a real Apple reader ("page->numKeys(N) >
+     * tree->maxKeys(510)") -- multi-leaf splitting is out of scope for this
+     * fix. Every tree this fork currently needs to produce (FACETKEYS/
+     * RENDITIONS for the shell's real, small catalogs) stays well under
+     * that limit.
+     */
+    size_t const node_size = 4096;
 
-    struct bom_tree_entry *entry = malloc(sizeof(*entry));
-    if (entry == NULL) {
+    uint8_t *entry_buffer = calloc(1, node_size);
+    if (entry_buffer == NULL) {
         bom_tree_free(tree_context);
         return NULL;
     }
 
     struct bom_tree *tree = malloc(sizeof(*tree));
     if (tree == NULL) {
-        free(entry);
+        free(entry_buffer);
         bom_tree_free(tree_context);
         return NULL;
     }
 
+    struct bom_tree_entry *entry = (struct bom_tree_entry *)entry_buffer;
     entry->is_leaf = htons(1); // todo
     entry->count = htons(0);
     entry->forward = htonl(0);
     entry->backward = htonl(0);
-    uint32_t entry_index = bom_index_add(tree_context->context, entry, sizeof(*entry));
-    free(entry);
+    uint32_t entry_index = bom_index_add(tree_context->context, entry_buffer, node_size);
+    free(entry_buffer);
 
     strncpy(tree->magic, "tree", 4);
     tree->version = htonl(1);
     tree->child = htonl(entry_index);
-    tree->node_size = htonl(4096); // todo
+    tree->node_size = htonl((uint32_t)node_size);
     tree->path_count = htonl(0);
     tree->unknown3 = 0;
     uint32_t tree_index = bom_index_add(tree_context->context, tree, sizeof(*tree));
@@ -231,6 +256,7 @@ bom_tree_add(struct bom_tree_context *tree_context, const void *key, size_t key_
     size_t entry_index = 0;
     size_t start_range = 0;
     size_t end_range = last_index;
+    bool exact_match = false;
 
     /* BOM trees store their keys sorted. Figure out the index for the new entry
        using binary search. start_range and end_range are inclusive possibilities. */
@@ -260,8 +286,30 @@ bom_tree_add(struct bom_tree_context *tree_context, const void *key, size_t key_
                must be greater than c's index. */
             start_range = entry_index + 1;
         } else {
+            exact_match = true;
             break;
         }
+    }
+
+    /*
+     * When the loop exits normally (no exact-match break), the correct
+     * insertion point is start_range (== end_range at that point) -- NOT
+     * whatever midpoint entry_index last held. Leaving entry_index at the
+     * stale midpoint is a real, empirically confirmed bug: for a purely
+     * ascending insertion sequence (every new key greater than everything
+     * already in the tree, e.g. copying an already-sorted RENDITIONS tree
+     * key-by-key in order), every insert after the second ends up placed
+     * one slot LEFT of where it belongs -- silently pushing the very first
+     * inserted entry one slot further right on every subsequent insert
+     * until it lands at the very end of the array, badly out of sorted
+     * order. Apple's real BOM-tree reader (CoreUI/assetutil) relies on
+     * true sorted order and misreads the resulting entry (observed: wrong
+     * Scale value read, corrupt/empty rendition data) even though this
+     * library's OWN reader tolerates it (bom_tree_iterate does a plain
+     * linear scan, order-independent).
+     */
+    if (!exact_match) {
+        entry_index = start_range;
     }
 
     /* Set the indexes for the inserted entry after shifting all other data */

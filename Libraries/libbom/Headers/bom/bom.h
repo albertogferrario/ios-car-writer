@@ -49,6 +49,23 @@ bom_memory(struct bom_context const *context);
 void
 bom_free(struct bom_context *context);
 
+/*
+ * Relocate the index+freelist+variables trailer from immediately after the
+ * header (this library's own bom_alloc_empty() layout: index+freelist,
+ * then variables, both packed right after the header, with real data
+ * blocks appended afterward) to the end of the file (real Apple BOM files'
+ * own layout: variables, then a 16-byte-aligned index+freelist, ending
+ * exactly at end-of-file, with data blocks immediately after the header).
+ * The two layouts are equally self-consistent -- every offset a reader
+ * needs is in the header regardless of physical ordering -- but a real
+ * Apple BOM reader (CoreUI/assetutil) expects the end-of-file convention
+ * and rejects the other one outright. Call this exactly once, after every
+ * block and variable has been added, immediately before the bom_context is
+ * finalized (e.g. before car::Writer::write()'s caller closes the file).
+ */
+void
+bom_relocate_trailer(struct bom_context *context);
+
 
 /* Index */
 

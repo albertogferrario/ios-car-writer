@@ -91,6 +91,20 @@ write() const
     uint32_t bom_index_count = 8 + facet_count * 2 + rendition_count * 2;
     bom_index_reserve(_bom.get(), bom_index_count);
 
+    /*
+     * Every real Apple-authored BOM file reserves index 0 as an empty
+     * (address=0, length=0) placeholder -- verified directly against a
+     * real CoreUI-972 catalog, where CARHEADER lives at index 1, never
+     * index 0. This library's own Reader never depended on that (it always
+     * looks blocks up by variable NAME via bom_variable_get(), never by
+     * assuming a specific index number), so the gap was invisible to every
+     * existing round-trip test here -- but a real Apple BOM reader
+     * (CoreUI/assetutil) does depend on it, and fails outright
+     * ("BOMStreamGetDataPointer buffer overflow") on any file that skips
+     * this placeholder and starts real content at index 0.
+     */
+    bom_free_indices_add(_bom.get(), 1);
+
     /* Write header. */
     struct car_header *header = (struct car_header *)malloc(sizeof(struct car_header));
     if (header == NULL) {

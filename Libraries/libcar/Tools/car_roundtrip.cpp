@@ -11,14 +11,23 @@
  *   - facets are copied via the structured facetIterate -> addFacet(Facet
  *     const&) path; losslessness is proven (not assumed) by the round-trip
  *     test in Tests/test_Writer.cpp via an independent raw FACETKEYS diff.
+ *   - every OTHER top-level BOM variable the source catalog carries --
+ *     anything libcar's structured Writer does not itself emit (observed on
+ *     real CoreUI-972 catalogs: APPEARANCEKEYS, BITMAPKEYS,
+ *     EXTENDED_METADATA; potentially others libcar/libbom, frozen since
+ *     2019, has never heard of) -- is passed through verbatim at the raw
+ *     libbom level (see passthroughVariable() below). Their absence is what
+ *     made Apple's own assetutil reject the previous ("four variables
+ *     only") output with "no header information" / "BOMStreamGetDataPointer
+ *     buffer overflow".
  *
  * CLI contract (243-02-PLAN.md <interfaces>):
  *   car-writer roundtrip --source <in.car> --out <out.car>
  *     -> exit 0 on success; writes a freshly re-serialized catalog.
  *   car-writer verify --source <original.car> --out <roundtripped.car>
- *     -> exit 0 iff header/KEYFORMAT/per-rendition-SHA-256/FACETKEYS are
- *        all consistent between the two files; non-zero + a JSON summary
- *        on stdout otherwise.
+ *     -> exit 0 iff header/KEYFORMAT/per-rendition-SHA-256/FACETKEYS/full
+ *        top-level-variable-name-set are all consistent between the two
+ *        files; non-zero + a JSON summary on stdout otherwise.
  */
 
 #include <car/Reader.h>
@@ -26,6 +35,7 @@
 #include <car/Facet.h>
 #include <car/car_format.h>
 #include <car/sha256.h>
+#include <car/VariablePassthrough.h>
 #include <bom/bom.h>
 
 #include <cstdio>
@@ -33,7 +43,9 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -101,6 +113,20 @@ std::string mapToJson(std::map<std::string, std::string> const &values)
     return json;
 }
 
+std::string joinNames(std::set<std::string> const &names)
+{
+    std::string joined;
+    bool first = true;
+    for (auto const &name : names) {
+        if (!first) {
+            joined += ", ";
+        }
+        first = false;
+        joined += name;
+    }
+    return joined;
+}
+
 void printUsage()
 {
     fprintf(stderr, "usage: car-writer roundtrip --source <in.car> --out <out.car>\n");
@@ -158,6 +184,29 @@ int cmdRoundtrip(std::string const &sourcePath, std::string const &outPath)
 
     writer->write();
 
+    /* Carry every OTHER top-level BOM variable through verbatim -- the
+     * variables libcar's structured Writer does not itself model (D-04's
+     * "everything else stays upstream" framing did not anticipate that
+     * upstream itself silently drops unmodeled variables entirely; see the
+     * file header comment above and 243-RESEARCH.md). Must run AFTER
+     * writer->write() so the four writer-managed variables already exist
+     * in the destination bom and are correctly skipped. */
+    car::passthroughUnmanagedVariables(reader->bom(), writer->bom());
+
+    /* Relocate the trailer (index+freelist+variables) from immediately
+     * after the header -- this library's own bom_alloc_empty() layout --
+     * to the end of the file, matching the layout every real Apple BOM
+     * file actually uses (variables, then a 16-byte-aligned index+
+     * freelist, ending exactly at EOF). This library's own Reader follows
+     * whatever offsets the header declares regardless of physical
+     * ordering, so the mismatch was invisible to every existing test; a
+     * real Apple BOM reader (CoreUI/assetutil) requires the end-of-file
+     * convention and otherwise fails with "no header information" /
+     * "BOMStreamGetDataPointer buffer overflow" on ANY output this writer
+     * produces, independent of which variables are present. Must run last,
+     * after every block/variable has been added. */
+    bom_relocate_trailer(writer->bom());
+
     return 0;
 }
 
@@ -192,6 +241,44 @@ int cmdVerify(std::string const &sourcePath, std::string const &outPath)
             "{\"pass\": false, \"category\": \"absolute_header_mismatch\", "
             "\"detail\": \"source header is not CoreUI 972/StorageVersion 17/SchemaVersion 2 (got %u/%u/%u)\"}\n",
             sourceHeader->ui_version, sourceHeader->storage_version, sourceHeader->schema_version
+        );
+        return 1;
+    }
+
+    /* Relative fidelity leg 0: the FULL top-level BOM variable NAME set is
+     * equal (set equality, not the four variables libcar's Writer happens
+     * to model). This is the check that closes the prior false-positive:
+     * before this fix, a round-trip that silently dropped APPEARANCEKEYS/
+     * BITMAPKEYS/EXTENDED_METADATA still passed verify, because verify only
+     * ever compared the four variables the SAME writer produced on both
+     * sides -- a circular check against libcar's own reader, never against
+     * the source's actual variable set. Must run before the per-variable
+     * checks below so a missing variable is reported as exactly that, not
+     * as an incidental header/keyformat mismatch. */
+    std::set<std::string> sourceVariables = car::variableNames(sourceReader->bom());
+    std::set<std::string> outVariables = car::variableNames(outReader->bom());
+    if (sourceVariables != outVariables) {
+        std::vector<std::string> missing;
+        for (auto const &name : sourceVariables) {
+            if (outVariables.find(name) == outVariables.end()) {
+                missing.push_back(name);
+            }
+        }
+        std::vector<std::string> unexpected;
+        for (auto const &name : outVariables) {
+            if (sourceVariables.find(name) == sourceVariables.end()) {
+                unexpected.push_back(name);
+            }
+        }
+        std::set<std::string> missingSet(missing.begin(), missing.end());
+        std::set<std::string> unexpectedSet(unexpected.begin(), unexpected.end());
+        printf(
+            "{\"pass\": false, \"category\": \"variable_set_mismatch\", "
+            "\"detail\": \"top-level BOM variable set differs from source\", "
+            "\"source_variables\": \"%s\", \"output_variables\": \"%s\", "
+            "\"missing\": \"%s\", \"unexpected\": \"%s\"}\n",
+            joinNames(sourceVariables).c_str(), joinNames(outVariables).c_str(),
+            joinNames(missingSet).c_str(), joinNames(unexpectedSet).c_str()
         );
         return 1;
     }
@@ -258,9 +345,9 @@ int cmdVerify(std::string const &sourcePath, std::string const &outPath)
 
     printf(
         "{\"pass\": true, \"header\": {\"ui_version\": %u, \"storage_version\": %u, \"schema_version\": %u}, "
-        "\"rendition_count\": %zu, \"facet_count\": %d, \"rendition_hashes\": %s}\n",
+        "\"rendition_count\": %zu, \"facet_count\": %d, \"variables\": \"%s\", \"rendition_hashes\": %s}\n",
         sourceHeader->ui_version, sourceHeader->storage_version, sourceHeader->schema_version,
-        sourceHashes.size(), sourceReader->facetCount(), mapToJson(sourceHashes).c_str()
+        sourceHashes.size(), sourceReader->facetCount(), joinNames(sourceVariables).c_str(), mapToJson(sourceHashes).c_str()
     );
     return 0;
 }

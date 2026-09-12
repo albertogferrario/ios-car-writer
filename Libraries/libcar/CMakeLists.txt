@@ -17,6 +17,7 @@ add_library(car
             Sources/Rendition.cpp
             Sources/car_format.c
             Sources/Writer.cpp
+            Sources/VariablePassthrough.cpp
             )
 
 find_package(ZLIB REQUIRED)

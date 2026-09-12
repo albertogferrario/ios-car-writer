@@ -149,6 +149,96 @@ bom_free(struct bom_context *context)
     free(context);
 }
 
+void
+bom_relocate_trailer(struct bom_context *context)
+{
+    assert(context != NULL);
+    assert(context->iteration_count == 0 && "cannot mutate while iterating");
+
+    struct bom_header *header = (struct bom_header *)context->memory.data;
+    uint32_t index_offset = ntohl(header->index_offset);
+    uint32_t index_length = ntohl(header->index_length);
+    uint32_t variables_offset = ntohl(header->variables_offset);
+    uint32_t trailer_len = ntohl(header->trailer_len);
+
+    /* This library's own bom_alloc_empty() always lays out
+     * [index+freelist][variables] contiguously right after the header
+     * (variables_offset == index_offset + index_length), with real data
+     * blocks appended afterward at ever-increasing offsets. Nothing to
+     * relocate if there is no data past the trailer yet. */
+    uint32_t chunk_start = index_offset;
+    uint32_t chunk_end = variables_offset + trailer_len;
+    size_t total_size = context->memory.size;
+    if (chunk_end >= total_size) {
+        return;
+    }
+    size_t data_len = total_size - chunk_end;
+
+    /* Compute the new layout up front (all sizes are known before touching
+     * any memory): data shifts left to right after the header, then
+     * variables, then index+freelist padded up to a 16-byte boundary,
+     * ending exactly at the new end of file -- matching the real
+     * convention observed directly in an Apple-authored catalog. Padding
+     * only ever adds bytes, so the new total size is always >= the old
+     * one; grow the backing memory first so every subsequent write stays
+     * in bounds. */
+    uint32_t new_variables_offset = chunk_start + (uint32_t)data_len;
+    uint32_t unaligned_index_offset = new_variables_offset + trailer_len;
+    uint32_t new_index_offset = (unaligned_index_offset + 15u) & ~15u;
+    size_t alignment_padding = new_index_offset - unaligned_index_offset;
+    size_t new_total_size = (size_t)new_index_offset + index_length;
+
+    uint8_t *variables_bytes = malloc(trailer_len);
+    memcpy(variables_bytes, (uint8_t *)header + variables_offset, trailer_len);
+
+    uint8_t *index_bytes = malloc(index_length);
+    memcpy(index_bytes, (uint8_t *)header + index_offset, index_length);
+
+    if (new_total_size > total_size) {
+        context->memory.resize(&context->memory, new_total_size);
+        header = (struct bom_header *)context->memory.data; /* re-fetch, may have moved */
+    }
+
+    /* Shift all real data blocks left, closing the gap the trailer used to
+     * occupy (safe with memmove regardless of overlap direction). */
+    memmove((uint8_t *)header + chunk_start, (uint8_t *)header + chunk_end, data_len);
+
+    memcpy((uint8_t *)header + new_variables_offset, variables_bytes, trailer_len);
+    free(variables_bytes);
+
+    if (alignment_padding > 0) {
+        memset((uint8_t *)header + unaligned_index_offset, 0, alignment_padding);
+    }
+    memcpy((uint8_t *)header + new_index_offset, index_bytes, index_length);
+    free(index_bytes);
+
+    if (new_total_size < total_size) {
+        context->memory.resize(&context->memory, new_total_size);
+        header = (struct bom_header *)context->memory.data;
+    }
+
+    /* Rewrite every data block's registered address: every real block used
+     * to live at or past chunk_end and shifted left by exactly
+     * (chunk_end - chunk_start). Unused index/freelist slots (address == 0
+     * && length == 0) are left untouched. */
+    uint32_t shift = chunk_end - chunk_start;
+    struct bom_index_header *index_header = (struct bom_index_header *)((uintptr_t)header + new_index_offset);
+    for (size_t i = 0; i < ntohl(index_header->count); i++) {
+        struct bom_index *entry = &index_header->index[i];
+        uint32_t address = ntohl(entry->address);
+        uint32_t length = ntohl(entry->length);
+        if (address == 0 && length == 0) {
+            continue;
+        }
+        if (address >= chunk_end) {
+            entry->address = htonl(address - shift);
+        }
+    }
+
+    header->variables_offset = htonl(new_variables_offset);
+    header->index_offset = htonl(new_index_offset);
+}
+
 
 static uint32_t
 _bom_address_update(uint32_t address, uint32_t point, ptrdiff_t delta)
@@ -245,10 +335,26 @@ bom_index_reserve(struct bom_context *context, size_t count)
     assert(context != NULL);
     assert(context->iteration_count == 0 && "cannot mutate while iterating");
     struct bom_header *header = (struct bom_header *)context->memory.data;
+    struct bom_index_header *index_header = (struct bom_index_header *)((uintptr_t)header + ntohl(header->index_offset));
 
-    /* Insert space for extra indexes at the end of the currently allocated space. */
+    /*
+     * Insert space immediately after the main index array's currently-used
+     * entries -- NOT at the end of the whole index+freelist region (the
+     * prior computation of index_point, "index_offset + index_length",
+     * landed past the freelist entirely). bom_index_add()'s own incremental
+     * growth path (see below) always writes new entries starting right
+     * after the last used main-index entry, which is exactly where the
+     * freelist header currently sits (nothing else separates them). A
+     * reservation that lands anywhere else is never actually reachable by
+     * bom_index_add(): the freelist header and its two dummy entries sit
+     * in the way and get silently overwritten by the first few real index
+     * insertions instead. This corruption is invisible to this library's
+     * own Reader (it never reads the freelist), but a real BOM consumer
+     * that does (e.g. Apple's own CoreUI/assetutil) rejects the result
+     * outright ("BOMStreamGetDataPointer buffer overflow").
+     */
     size_t old_index_length = ntohl(header->index_length);
-    uint32_t index_point = ntohl(header->index_offset) + old_index_length;
+    uint32_t index_point = ntohl(header->index_offset) + sizeof(struct bom_index_header) + sizeof(struct bom_index) * ntohl(index_header->count);
     ptrdiff_t index_delta = sizeof(struct bom_index) * count;
     size_t new_index_length = old_index_length + index_delta;
     _bom_address_resize(context, index_point, index_delta);
@@ -258,7 +364,7 @@ bom_index_reserve(struct bom_context *context, size_t count)
     header->index_length = htonl(new_index_length);
 
     /* Reset the memory in the reallocated space */
-    void *memory_to_reset = (void *)((uintptr_t)header + ntohl(header->index_offset) + old_index_length);
+    void *memory_to_reset = (void *)((uintptr_t)header + index_point);
     memset(memory_to_reset, 0, index_delta);
 }
 

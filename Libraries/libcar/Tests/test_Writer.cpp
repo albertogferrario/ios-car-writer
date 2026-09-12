@@ -17,6 +17,7 @@
 #include <car/Writer.h>
 #include <car/Reader.h>
 #include <car/sha256.h>
+#include <car/VariablePassthrough.h>
 
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <vector>
 
 #ifndef CAR_ROUNDTRIP_REPO_ROOT
@@ -627,6 +629,97 @@ TEST(Writer, TestRealShellCatalogZeroContentRoundTrip)
      * cardinality, before and after. */
     EXPECT_EQ(sourceReader2->facetCount(), outReader->facetCount());
     EXPECT_EQ(sourceReader2->renditionCount(), outReader->renditionCount());
+
+    std::remove(outputPath.c_str());
+}
+
+TEST(Writer, TestRealShellCatalogAllVariablesPreserved)
+{
+    /*
+     * The finding this fix addresses (discovered during the Phase 243
+     * live-proof gate, validated against Apple's own assetutil, not just
+     * this fork's own circular self-check): the 2019-archived libcar
+     * Writer only models 4 top-level BOM variables (CARHEADER, KEYFORMAT,
+     * FACETKEYS, RENDITIONS) and silently drops the newer ones a real
+     * CoreUI-972 catalog also carries (APPEARANCEKEYS, BITMAPKEYS,
+     * EXTENDED_METADATA) -- Apple's own assetutil rejects the resulting
+     * file outright ("no header information" / "BOMStreamGetDataPointer
+     * buffer overflow"). This test is the platform-independent (no
+     * assetutil dependency, so it runs in the Alpine CI too) regression
+     * guard: the full top-level variable NAME SET must be preserved,
+     * exactly, not just the four variables Writer itself understands.
+     */
+    std::string fixturePath = std::string(CAR_ROUNDTRIP_REPO_ROOT) + "/Tests/fixtures/shell/Assets.car";
+    std::string outputPath = "real_shell_all_variables_output.car";
+    std::remove(outputPath.c_str());
+
+    struct bom_context_memory sourceMemory = bom_context_memory_file(fixturePath.c_str(), /* writeable */ false, 0);
+    ASSERT_NE(sourceMemory.data, nullptr) << "shell fixture not found or unreadable: " << fixturePath;
+    ASSERT_GT(sourceMemory.size, static_cast<size_t>(0));
+
+    auto sourceBom = car::Reader::unique_ptr_bom(bom_alloc_load(sourceMemory), bom_free);
+    ASSERT_NE(sourceBom, nullptr);
+
+    ext::optional<car::Reader> sourceReader = car::Reader::Load(std::move(sourceBom));
+    ASSERT_NE(sourceReader, ext::nullopt);
+
+    /* The exact real-fixture variable set this fix must reproduce -- fixed
+     * expectation, not derived from the source read above, so a bug that
+     * corrupts BOTH the source parse and the round-trip identically could
+     * not silently pass this assertion. */
+    std::set<std::string> const expectedVariables = {
+        "APPEARANCEKEYS", "BITMAPKEYS", "CARHEADER", "EXTENDED_METADATA", "FACETKEYS", "KEYFORMAT", "RENDITIONS"
+    };
+    std::set<std::string> sourceVariables = car::variableNames(sourceReader->bom());
+    ASSERT_EQ(sourceVariables, expectedVariables) << "fixture itself does not carry the expected 7 variables";
+
+    {
+        struct bom_context_memory outMemory = bom_context_memory_file(outputPath.c_str(), /* writeable */ true, 0);
+        ASSERT_NE(outMemory.data, nullptr);
+
+        auto outBom = car::Writer::unique_ptr_bom(bom_alloc_empty(outMemory), bom_free);
+        ASSERT_NE(outBom, nullptr);
+
+        ext::optional<car::Writer> writer = car::Writer::Create(std::move(outBom));
+        ASSERT_NE(writer, ext::nullopt);
+
+        writer->header() = sourceReader->header();
+        writer->keyfmt() = sourceReader->keyfmt();
+
+        sourceReader->renditionFastIterate([&writer](void *key, size_t keyLen, void *value, size_t valueLen) {
+            writer->addRendition(key, keyLen, value, valueLen);
+        });
+        sourceReader->facetIterate([&writer](car::Facet const &facet) {
+            writer->addFacet(facet);
+        });
+
+        writer->write();
+
+        /* The fix under test: carry every OTHER top-level variable through
+         * verbatim, then relocate the trailer to match the real BOM
+         * end-of-file convention. */
+        car::passthroughUnmanagedVariables(sourceReader->bom(), writer->bom());
+        bom_relocate_trailer(writer->bom());
+    }
+
+    struct bom_context_memory outMemory2 = bom_context_memory_file(outputPath.c_str(), false, 0);
+    ASSERT_NE(outMemory2.data, nullptr);
+    auto outBom2 = car::Reader::unique_ptr_bom(bom_alloc_load(outMemory2), bom_free);
+    ASSERT_NE(outBom2, nullptr);
+    ext::optional<car::Reader> outReader = car::Reader::Load(std::move(outBom2));
+    ASSERT_NE(outReader, ext::nullopt);
+
+    std::set<std::string> outVariables = car::variableNames(outReader->bom());
+
+    /* The load-bearing assertion: the round-tripped output's FULL variable
+     * set equals the source's, not just the four Writer itself emits. A
+     * lossy round-trip (the pre-fix behavior) fails this with outVariables
+     * == {CARHEADER, FACETKEYS, KEYFORMAT, RENDITIONS} -- missing
+     * APPEARANCEKEYS/BITMAPKEYS/EXTENDED_METADATA. */
+    EXPECT_EQ(outVariables, sourceVariables)
+        << "round-tripped output is missing top-level BOM variables present in the source -- "
+        << "the fix that carries APPEARANCEKEYS/BITMAPKEYS/EXTENDED_METADATA through verbatim regressed";
+    EXPECT_EQ(outVariables, expectedVariables);
 
     std::remove(outputPath.c_str());
 }
