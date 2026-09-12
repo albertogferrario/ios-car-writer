@@ -32,9 +32,19 @@ target_link_libraries(car PUBLIC ext bom ${COMPRESSION})
 target_include_directories(car PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Headers")
 install(TARGETS car DESTINATION usr/lib)
 
+# car_roundtrip: the roundtrip/verify CLI (Phase 243 Plan 02), wiring
+# Reader -> Writer end to end. See Tools/car_roundtrip.cpp.
+add_executable(car_roundtrip Tools/car_roundtrip.cpp)
+target_link_libraries(car_roundtrip PRIVATE car)
+install(TARGETS car_roundtrip DESTINATION usr/bin)
+
 if (BUILD_TESTING)
   ADD_UNIT_GTEST(car Facet Tests/test_Facet.cpp)
   ADD_UNIT_GTEST(car Rendition Tests/test_Rendition.cpp)
   ADD_UNIT_GTEST(car AttributeList Tests/test_AttributeList.cpp)
   ADD_UNIT_GTEST(car Writer Tests/test_Writer.cpp)
+
+  # Lets the real-shell-catalog round-trip test (test_Writer.cpp) locate the
+  # checked-in fixture regardless of ctest's working directory.
+  target_compile_definitions(test_car_Writer PRIVATE CAR_ROUNDTRIP_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 endif ()
