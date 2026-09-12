@@ -25,6 +25,7 @@ using car::Rendition;
 Reader::
 Reader(unique_ptr_bom bom) :
     _bom(std::move(bom)),
+    _header(ext::nullopt),
     _keyfmt(ext::nullopt),
     _facetValues({ }),
     _renditionValues({ })
@@ -179,6 +180,8 @@ Load(unique_ptr_bom bom)
     }
 
     auto reader = Reader(std::move(bom));
+
+    reader._header = ext::optional<struct car_header *>(header);
 
     /*
      * Iterate through the facets as fast as possible just save the name and value pointer for lookups later.

@@ -42,6 +42,7 @@ private:
 
 private:
     unique_ptr_bom                                  _bom;
+    ext::optional<struct car_header *>              _header;
     ext::optional<struct car_key_format *>          _keyfmt;
     std::unordered_map<std::string, void *>         _facetValues;
     std::unordered_multimap<uint16_t, KeyValuePair> _renditionValues;
@@ -65,6 +66,12 @@ public:
      */
     struct car_key_format *keyfmt() const
     { return *_keyfmt; }
+
+    /*
+     * The CARHEADER, parsed at Load() time -- pairs with Writer::header().
+     */
+    struct car_header *header() const
+    { return *_header; }
 
     /*
      * The number of Facets read

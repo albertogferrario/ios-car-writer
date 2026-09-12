@@ -97,24 +97,36 @@ write() const
         return;
     }
 
-    strncpy(header->magic, "RATC", 4);
-    header->ui_version = 0x131; // TODO
-    header->storage_version = 0xC; // TODO
-    header->storage_timestamp = static_cast<uint32_t>(time(NULL)); // TODO
-    header->rendition_count = 0;
-    strncpy(header->file_creator, "asset catalog compiler\n", sizeof(header->file_creator));
-    strncpy(header->other_creator, "version 1.0", sizeof(header->other_creator));
+    if (_header != ext::nullopt) {
+        /*
+         * Full-struct override: carry every source CARHEADER field through
+         * verbatim (magic/ui_version/storage_version/schema_version, plus
+         * uuid/storage_timestamp/associated_checksum/rendition_count/
+         * file_creator/other_creator/color_space_id/key_semantics), instead
+         * of the stale synthesis constants below. Never emits 0x131/0xC/4
+         * when an override is present.
+         */
+        memcpy(header, *_header, sizeof(struct car_header));
+    } else {
+        strncpy(header->magic, "RATC", 4);
+        header->ui_version = 0x131; // TODO
+        header->storage_version = 0xC; // TODO
+        header->storage_timestamp = static_cast<uint32_t>(time(NULL)); // TODO
+        header->rendition_count = rendition_count;
+        strncpy(header->file_creator, "asset catalog compiler\n", sizeof(header->file_creator));
+        strncpy(header->other_creator, "version 1.0", sizeof(header->other_creator));
 
-    std::random_device device;
-    std::uniform_int_distribution<int> distribution = std::uniform_int_distribution<int>(std::numeric_limits<uint8_t>::min(), std::numeric_limits<uint8_t>::max());
-    for (size_t i = 0; i < sizeof(header->uuid); i++) {
-        header->uuid[i] = distribution(device);
+        std::random_device device;
+        std::uniform_int_distribution<int> distribution = std::uniform_int_distribution<int>(std::numeric_limits<uint8_t>::min(), std::numeric_limits<uint8_t>::max());
+        for (size_t i = 0; i < sizeof(header->uuid); i++) {
+            header->uuid[i] = distribution(device);
+        }
+
+        header->associated_checksum = 0; // TODO
+        header->schema_version = 4; // TODO
+        header->color_space_id = 1; // TODO
+        header->key_semantics = 1; // TODO
     }
-
-    header->associated_checksum = 0; // TODO
-    header->schema_version = 4; // TODO
-    header->color_space_id = 1; // TODO
-    header->key_semantics = 1; // TODO
 
     int header_index = bom_index_add(_bom.get(), header, sizeof(struct car_header));
     bom_variable_add(_bom.get(), car_header_variable, header_index);

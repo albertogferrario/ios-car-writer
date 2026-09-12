@@ -40,6 +40,7 @@ private:
 
 private:
     unique_ptr_bom _bom;
+    ext::optional<struct car_header *> _header;
     ext::optional<struct car_key_format *> _keyfmt;
     std::unordered_map<std::string, Facet> _facets;
     std::unordered_multimap<uint16_t, Rendition> _renditions;
@@ -76,6 +77,16 @@ public:
      */
     ext::optional<struct car_key_format *> &keyfmt()
     { return _keyfmt; }
+
+    /*
+     * The CARHEADER, optional and synthesized automatically if omitted. When
+     * set, every field is carried through write() verbatim (a full-struct
+     * override, not a partial patch) -- the mechanism a zero-content
+     * round-trip uses to carry a source catalog's real header through
+     * instead of the stale hardcoded synthesis constants.
+     */
+    ext::optional<struct car_header *> &header()
+    { return _header; }
 
 public:
     /*
