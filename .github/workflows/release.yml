@@ -36,17 +36,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug -- locate zlib-static contents
-        run: |
-          apk info -L zlib-static
-          apk info -L zlib-dev
-
       - name: Configure (static link, tests on)
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+            -DZLIB_LIBRARY=/lib/libz.a \
+            -DZLIB_INCLUDE_DIR=/usr/include \
             -DBUILD_TESTING=ON \
             .
 
