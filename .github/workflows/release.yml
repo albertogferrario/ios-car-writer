@@ -54,9 +54,13 @@ jobs:
 
       - name: Verify static-musl link
         run: |
+          # file(1) is the authoritative, safe check here. ldd(1) is
+          # deliberately not used: on a genuinely static ELF there is no
+          # dynamic loader to intercept LD_TRACE_LOADED_OBJECTS, so some
+          # ldd implementations fall back to exec()-ing the binary being
+          # inspected -- unsafe for a build artifact under test.
           file build/car_roundtrip
           file build/car_roundtrip | grep -q "statically linked"
-          ldd build/car_roundtrip 2>&1 | grep -q "not a dynamic executable"
 
       - name: Run car_roundtrip against the real fixture (execution proof)
         run: |
