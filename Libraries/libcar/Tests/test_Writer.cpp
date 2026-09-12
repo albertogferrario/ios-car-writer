@@ -263,6 +263,100 @@ TEST(Writer, TestWriterHeaderOverrideRoundTrips)
     EXPECT_EQ(memcmp(round_tripped, &source_header, sizeof(struct car_header)), 0);
 }
 
+TEST(Writer, TestWriterHeaderChainFromReader)
+{
+    /*
+     * Proves the exact composition the round-trip driver (Plan 02) relies
+     * on: writer.header() = reader.header() (paired with the pre-existing
+     * writer.keyfmt() = reader.keyfmt()) carries a parsed source header and
+     * key format through a second Writer/Reader hop byte-identical, with
+     * renditions copied via the raw-KV fast-edit path (D-15) -- no field
+     * ever touched individually by the driver.
+     */
+    int width = 8;
+    int height = 8;
+
+    struct car_header source_header;
+    memset(&source_header, 0, sizeof(source_header));
+    memcpy(source_header.magic, "RATC", 4);
+    source_header.ui_version = 972;
+    source_header.storage_version = 17;
+    source_header.storage_timestamp = 0x11223344;
+    source_header.rendition_count = 1;
+    strncpy(source_header.file_creator, "chain test\n", sizeof(source_header.file_creator));
+    strncpy(source_header.other_creator, "chain test other", sizeof(source_header.other_creator));
+    for (size_t i = 0; i < sizeof(source_header.uuid); i++) {
+        source_header.uuid[i] = static_cast<uint8_t>(0xA0 + i);
+    }
+    source_header.associated_checksum = 0xC0FFEE;
+    source_header.schema_version = 2;
+    source_header.color_space_id = 1;
+    source_header.key_semantics = 1;
+
+    /* First hop: write a synthetic catalog with an explicit header override. */
+    auto writer1_bom = car::Writer::unique_ptr_bom(bom_alloc_empty(bom_context_memory(NULL, 0)), bom_free);
+    auto writer1 = car::Writer::Create(std::move(writer1_bom));
+    EXPECT_NE(writer1, ext::nullopt);
+    writer1->header() = &source_header;
+
+    car::AttributeList attributes = car::AttributeList({
+        { car_attribute_identifier_idiom, car_attribute_identifier_idiom_value_universal },
+        { car_attribute_identifier_scale, 2 },
+        { car_attribute_identifier_identifier, 1 },
+    });
+    car::Facet facet = car::Facet::Create("chaintest", attributes);
+    writer1->addFacet(facet);
+
+    auto data = car::Rendition::Data(test_pixels, car::Rendition::Data::Format::PremultipliedBGRA8);
+    car::Rendition rendition = car::Rendition::Create(attributes, data);
+    rendition.width() = width;
+    rendition.height() = height;
+    rendition.scale() = 2;
+    rendition.fileName() = "chaintest.png";
+    rendition.layout() = car_rendition_value_layout_one_part_scale;
+    writer1->addRendition(rendition);
+
+    writer1->write();
+
+    struct bom_context_memory const *writer1_memory = bom_memory(writer1->bom());
+    struct bom_context_memory reader1_memory = bom_context_memory(writer1_memory->data, writer1_memory->size);
+    auto reader1_bom = std::unique_ptr<struct bom_context, decltype(&bom_free)>(bom_alloc_load(reader1_memory), bom_free);
+    ext::optional<car::Reader> reader1 = car::Reader::Load(std::move(reader1_bom));
+    EXPECT_NE(reader1, ext::nullopt);
+
+    /* Second hop: the exact composition pattern the round-trip driver uses. */
+    auto writer2_bom = car::Writer::unique_ptr_bom(bom_alloc_empty(bom_context_memory(NULL, 0)), bom_free);
+    auto writer2 = car::Writer::Create(std::move(writer2_bom));
+    EXPECT_NE(writer2, ext::nullopt);
+
+    writer2->header() = reader1->header();
+    writer2->keyfmt() = reader1->keyfmt();
+
+    reader1->renditionFastIterate([&writer2](void *key, size_t key_len, void *value, size_t value_len) {
+        writer2->addRendition(key, key_len, value, value_len);
+    });
+    reader1->facetIterate([&writer2](car::Facet const &f) { writer2->addFacet(f); });
+
+    writer2->write();
+
+    struct bom_context_memory const *writer2_memory = bom_memory(writer2->bom());
+    struct bom_context_memory reader2_memory = bom_context_memory(writer2_memory->data, writer2_memory->size);
+    auto reader2_bom = std::unique_ptr<struct bom_context, decltype(&bom_free)>(bom_alloc_load(reader2_memory), bom_free);
+    ext::optional<car::Reader> reader2 = car::Reader::Load(std::move(reader2_bom));
+    EXPECT_NE(reader2, ext::nullopt);
+
+    /* The second hop's header must be byte-identical to the first hop's
+     * parsed header -- the chain carries the source header through two full
+     * write/read cycles without drift. */
+    EXPECT_EQ(memcmp(reader2->header(), reader1->header(), sizeof(struct car_header)), 0);
+
+    /* The key format token list must also survive the chain unchanged. */
+    struct car_key_format *keyfmt1 = reader1->keyfmt();
+    struct car_key_format *keyfmt2 = reader2->keyfmt();
+    ASSERT_EQ(keyfmt2->num_identifiers, keyfmt1->num_identifiers);
+    EXPECT_EQ(memcmp(keyfmt2->identifier_list, keyfmt1->identifier_list, keyfmt1->num_identifiers * sizeof(uint32_t)), 0);
+}
+
 TEST(Writer, TestWriterRenditionCountAndSynthesisFallback)
 {
     /*
