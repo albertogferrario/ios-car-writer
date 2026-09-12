@@ -16,12 +16,20 @@
 #include <car/Facet.h>
 #include <car/Writer.h>
 #include <car/Reader.h>
+#include <car/sha256.h>
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 
+#include <fstream>
+#include <iostream>
+#include <map>
 #include <vector>
+
+#ifndef CAR_ROUNDTRIP_REPO_ROOT
+#define CAR_ROUNDTRIP_REPO_ROOT "."
+#endif
 
 // Test pattern as raw pixed data, in PremultipliedBGRA8 format
 static std::vector<uint8_t> test_pixels = {
@@ -420,6 +428,207 @@ TEST(Writer, TestWriterRenditionCountAndSynthesisFallback)
     EXPECT_EQ(header->color_space_id, static_cast<uint32_t>(1));
     EXPECT_EQ(header->key_semantics, static_cast<uint32_t>(1));
     EXPECT_EQ(header->associated_checksum, static_cast<uint32_t>(0));
+}
+
+TEST(Sha256, KnownVectors)
+{
+    /*
+     * Sanity-check the vendored SHA-256 implementation (car/sha256.h)
+     * against the two textbook FIPS 180-4 test vectors before trusting it
+     * for the real-catalog round-trip's per-rendition identity check below.
+     */
+    EXPECT_EQ(car::sha256Hex("", 0), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    std::string abc = "abc";
+    EXPECT_EQ(car::sha256Hex(abc.data(), abc.size()), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+TEST(Writer, TestMalformedInputTruncatedFileFailsCleanly)
+{
+    /*
+     * Security Domain V5 (243-RESEARCH.md): even in this pipeline's closed
+     * trust model, a malformed/truncated BOM must fail cleanly (a caught
+     * error / non-zero return), never crash or read out of bounds.
+     */
+    std::string path = "malformed_truncated.car";
+    std::remove(path.c_str());
+
+    /* Well below sizeof(struct bom_header) (32 bytes) -- must be rejected
+     * by bom_alloc_load's own size check before any field is read. */
+    std::vector<uint8_t> buffer(16, 0);
+    memcpy(buffer.data(), "BOMStore", 8);
+
+    std::ofstream out(path, std::ios::binary);
+    ASSERT_TRUE(out.good());
+    out.write(reinterpret_cast<char const *>(buffer.data()), buffer.size());
+    out.close();
+
+    struct bom_context_memory memory = bom_context_memory_file(path.c_str(), false, 0);
+    ASSERT_NE(memory.data, nullptr);
+    ASSERT_GT(memory.size, static_cast<size_t>(0));
+
+    auto bom = car::Reader::unique_ptr_bom(bom_alloc_load(memory), bom_free);
+    EXPECT_EQ(bom, nullptr) << "a truncated BOM must fail to load cleanly, never crash or read OOB";
+
+    std::remove(path.c_str());
+}
+
+TEST(Writer, TestMalformedInputBadMagicFailsCleanly)
+{
+    std::string path = "malformed_bad_magic.car";
+    std::remove(path.c_str());
+
+    /* Full-size buffer (well above sizeof(struct bom_header)) but with
+     * wrong magic bytes -- must be rejected on the magic check, not crash. */
+    std::vector<uint8_t> buffer(512, 0);
+    memcpy(buffer.data(), "NOTABOMX", 8);
+
+    std::ofstream out(path, std::ios::binary);
+    ASSERT_TRUE(out.good());
+    out.write(reinterpret_cast<char const *>(buffer.data()), buffer.size());
+    out.close();
+
+    struct bom_context_memory memory = bom_context_memory_file(path.c_str(), false, 0);
+    ASSERT_NE(memory.data, nullptr);
+    ASSERT_GT(memory.size, static_cast<size_t>(0));
+
+    auto bom = car::Reader::unique_ptr_bom(bom_alloc_load(memory), bom_free);
+    EXPECT_EQ(bom, nullptr) << "a bad-magic BOM must fail to load cleanly, never crash or read OOB";
+
+    std::remove(path.c_str());
+}
+
+TEST(Writer, TestRealShellCatalogZeroContentRoundTrip)
+{
+    /*
+     * The load-bearing proof (243-CONTEXT.md D-11/D-12/D-13): round-tripping
+     * the shell's REAL Assets.car (checked into Tests/fixtures/shell/, not a
+     * synthetic fixture) through a fresh Writer/Reader hop must be
+     * semantically byte-faithful -- header/KEYFORMAT byte-identical, every
+     * rendition's payload SHA-256-identical, and FACETKEYS/RENDITIONS
+     * consistent. This is the writer's first passing test against real
+     * data, before any branded-content logic exists anywhere (Pitfall 3).
+     */
+    std::string fixturePath = std::string(CAR_ROUNDTRIP_REPO_ROOT) + "/Tests/fixtures/shell/Assets.car";
+    std::string outputPath = "real_shell_roundtrip_output.car";
+    std::remove(outputPath.c_str());
+
+    /* 1. Load the shell's real catalog read-only. */
+    struct bom_context_memory sourceMemory = bom_context_memory_file(fixturePath.c_str(), /* writeable */ false, 0);
+    ASSERT_NE(sourceMemory.data, nullptr) << "shell fixture not found or unreadable: " << fixturePath;
+    ASSERT_GT(sourceMemory.size, static_cast<size_t>(0));
+
+    auto sourceBom = car::Reader::unique_ptr_bom(bom_alloc_load(sourceMemory), bom_free);
+    ASSERT_NE(sourceBom, nullptr);
+
+    ext::optional<car::Reader> sourceReader = car::Reader::Load(std::move(sourceBom));
+    ASSERT_NE(sourceReader, ext::nullopt);
+
+    /* 2. Round-trip: fresh output BOM (never in-place patched, Pitfall 3),
+     * header+keyfmt carried through verbatim, renditions copied raw-KV
+     * (D-15), facets copied via the structured path (checked below). */
+    {
+        struct bom_context_memory outMemory = bom_context_memory_file(outputPath.c_str(), /* writeable */ true, 0);
+        ASSERT_NE(outMemory.data, nullptr);
+
+        auto outBom = car::Writer::unique_ptr_bom(bom_alloc_empty(outMemory), bom_free);
+        ASSERT_NE(outBom, nullptr);
+
+        ext::optional<car::Writer> writer = car::Writer::Create(std::move(outBom));
+        ASSERT_NE(writer, ext::nullopt);
+
+        writer->header() = sourceReader->header();
+        writer->keyfmt() = sourceReader->keyfmt();
+
+        sourceReader->renditionFastIterate([&writer](void *key, size_t keyLen, void *value, size_t valueLen) {
+            writer->addRendition(key, keyLen, value, valueLen);
+        });
+        sourceReader->facetIterate([&writer](car::Facet const &facet) {
+            writer->addFacet(facet);
+        });
+
+        writer->write();
+        /* writer goes out of scope here -- bom_free() flushes to disk
+         * before the output file is re-opened for verification below. */
+    }
+
+    /* 3. Re-open the source fixture fresh (a second, independent Reader --
+     * the first one's underlying mmap must not be reused for the diff) and
+     * the round-tripped output, then assert the full structural pre-gate. */
+    struct bom_context_memory sourceMemory2 = bom_context_memory_file(fixturePath.c_str(), false, 0);
+    ASSERT_NE(sourceMemory2.data, nullptr);
+    auto sourceBom2 = car::Reader::unique_ptr_bom(bom_alloc_load(sourceMemory2), bom_free);
+    ASSERT_NE(sourceBom2, nullptr);
+    ext::optional<car::Reader> sourceReader2 = car::Reader::Load(std::move(sourceBom2));
+    ASSERT_NE(sourceReader2, ext::nullopt);
+
+    struct bom_context_memory outMemory2 = bom_context_memory_file(outputPath.c_str(), false, 0);
+    ASSERT_NE(outMemory2.data, nullptr);
+    auto outBom2 = car::Reader::unique_ptr_bom(bom_alloc_load(outMemory2), bom_free);
+    ASSERT_NE(outBom2, nullptr);
+    ext::optional<car::Reader> outReader = car::Reader::Load(std::move(outBom2));
+    ASSERT_NE(outReader, ext::nullopt);
+
+    /* Absolute correctness (D-11 leg 2): the shell's real header is CoreUI
+     * 972 / StorageVersion 17 / SchemaVersion 2 -- cross-verified via
+     * assetutil and viraptor/actool (243-RESEARCH.md). */
+    struct car_header *sourceHeader = sourceReader2->header();
+    EXPECT_EQ(sourceHeader->ui_version, static_cast<uint32_t>(972));
+    EXPECT_EQ(sourceHeader->storage_version, static_cast<uint32_t>(17));
+    EXPECT_EQ(sourceHeader->schema_version, static_cast<uint32_t>(2));
+
+    /* Relative fidelity leg 1: full CARHEADER byte-identical (all 12
+     * fields, Pitfall A -- not just the 3 version fields). */
+    struct car_header *outHeader = outReader->header();
+    EXPECT_EQ(memcmp(sourceHeader, outHeader, sizeof(struct car_header)), 0);
+
+    /* Relative fidelity leg 2: KEYFORMAT token list byte-identical. */
+    struct car_key_format *sourceKeyfmt = sourceReader2->keyfmt();
+    struct car_key_format *outKeyfmt = outReader->keyfmt();
+    ASSERT_EQ(sourceKeyfmt->num_identifiers, outKeyfmt->num_identifiers);
+    EXPECT_EQ(memcmp(sourceKeyfmt->identifier_list, outKeyfmt->identifier_list, sourceKeyfmt->num_identifiers * sizeof(uint32_t)), 0);
+
+    /* Relative fidelity leg 3: per-rendition SHA-256 identity (D-13 shape --
+     * hex(key) -> sha256(value) -- seeds Phase 244's CatalogVerifier). */
+    std::map<std::string, std::string> sourceHashes;
+    sourceReader2->renditionFastIterate([&sourceHashes](void *key, size_t keyLen, void *value, size_t valueLen) {
+        sourceHashes[car::bytesToHex(key, keyLen)] = car::sha256Hex(value, valueLen);
+    });
+    std::map<std::string, std::string> outHashes;
+    outReader->renditionFastIterate([&outHashes](void *key, size_t keyLen, void *value, size_t valueLen) {
+        outHashes[car::bytesToHex(key, keyLen)] = car::sha256Hex(value, valueLen);
+    });
+    ASSERT_GT(sourceHashes.size(), static_cast<size_t>(0)) << "shell fixture has zero renditions -- fixture is empty/invalid";
+    EXPECT_EQ(sourceHashes, outHashes);
+
+    std::cout << "[ real-shell-roundtrip ] " << sourceHashes.size()
+              << " renditions, all SHA-256-identical" << std::endl;
+
+    /* Relative fidelity leg 4 (Open Question 1 / A4, Pitfall B): the
+     * structured facetIterate -> addFacet(Facet const&) path's losslessness
+     * is NOT assumed -- it is proven here directly against the raw
+     * FACETKEYS bytes via facetFastIterate on both sides. If this ever
+     * diverges, the contingency is a raw addFacet(void*,size_t,void*,size_t)
+     * mirroring the existing raw addRendition (see the plan SUMMARY for
+     * whether that edit was required). */
+    std::map<std::string, std::string> sourceFacetBytes;
+    sourceReader2->facetFastIterate([&sourceFacetBytes](void *key, size_t keyLen, void *value, size_t valueLen) {
+        sourceFacetBytes[car::bytesToHex(key, keyLen)] = car::bytesToHex(value, valueLen);
+    });
+    std::map<std::string, std::string> outFacetBytes;
+    outReader->facetFastIterate([&outFacetBytes](void *key, size_t keyLen, void *value, size_t valueLen) {
+        outFacetBytes[car::bytesToHex(key, keyLen)] = car::bytesToHex(value, valueLen);
+    });
+    EXPECT_EQ(sourceFacetBytes, outFacetBytes)
+        << "FACETKEYS raw bytes diverged -- the structured addFacet() path is lossy; "
+        << "the raw-addFacet contingency (edit 5) is required";
+
+    /* FACETKEYS/RENDITIONS consistency: same facet-name/rendition-key set
+     * cardinality, before and after. */
+    EXPECT_EQ(sourceReader2->facetCount(), outReader->facetCount());
+    EXPECT_EQ(sourceReader2->renditionCount(), outReader->renditionCount());
+
+    std::remove(outputPath.c_str());
 }
 
 TEST(Writer, TestWriter100Optimal)
