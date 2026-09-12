@@ -1,0 +1,62 @@
+#
+# CI for ios-car-writer (Phase 243 Plan 03, D-05/D-07/D-08).
+#
+# Builds car_roundtrip as a fully static musl binary inside an Alpine
+# container (matching .do/Dockerfile's own base OS -- no glibc/musl ABI
+# mismatch is possible), gates on a green GoogleTest run (ctest), and
+# verifies the linked binary is actually static before anything else runs.
+# zlib is the only real build dependency (see Libraries/libcar/CMakeLists.txt
+# -- no libpng/libxml2 link is required).
+#
+# Triggered by a pinned tag push or manual dispatch.
+#
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+    defaults:
+      run:
+        shell: sh
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache build-base cmake zlib-dev zlib-static git file
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (static link, tests on)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DBUILD_TESTING=ON \
+            .
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Run GoogleTest suite (hard gate)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Verify static-musl link
+        run: |
+          file build/car_roundtrip
+          file build/car_roundtrip | grep -q "statically linked"
+          ldd build/car_roundtrip 2>&1 | grep -q "not a dynamic executable"
+
+      - name: Run car_roundtrip against the real fixture (execution proof)
+        run: |
+          ./build/car_roundtrip roundtrip --source Tests/fixtures/shell/Assets.car --out /tmp/rt.car
+          ./build/car_roundtrip verify --source Tests/fixtures/shell/Assets.car --out /tmp/rt.car
