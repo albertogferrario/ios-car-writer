@@ -131,6 +131,7 @@ void printUsage()
 {
     fprintf(stderr, "usage: car-writer roundtrip --source <in.car> --out <out.car>\n");
     fprintf(stderr, "       car-writer verify --source <original.car> --out <roundtripped.car>\n");
+    fprintf(stderr, "       car-writer patch --source <in.car> --icon-1024 <master.png> --splash-logo <logo.png> --splash-bg-hex '#RRGGBB' --out <out.car>\n");
 }
 
 int cmdRoundtrip(std::string const &sourcePath, std::string const &outPath)
@@ -352,6 +353,71 @@ int cmdVerify(std::string const &sourcePath, std::string const &outPath)
     return 0;
 }
 
+/*
+ * car-writer patch: reproduces cmdRoundtrip()'s full BOM re-serialization
+ * but substitutes exactly the AppIcon and SplashScreenLogo renditions with
+ * fresh content derived from the supplied PNG inputs (Phase 244 Plan 02).
+ * SplashScreenBackground and every other rendition stay byte-verbatim in
+ * THIS commit -- the branding logic itself lands in a follow-up commit on
+ * this same plan; at this point cmdPatch is behaviorally identical to
+ * cmdRoundtrip. --icon-1024/--splash-logo/--splash-bg-hex are accepted but
+ * unused here so the CLI surface is stable before the branding logic wires
+ * into it.
+ */
+int cmdPatch(
+    std::string const &sourcePath,
+    std::string const &iconPath,
+    std::string const &splashLogoPath,
+    std::string const &splashBgHex,
+    std::string const &outPath)
+{
+    (void)iconPath;
+    (void)splashLogoPath;
+    (void)splashBgHex;
+
+    ext::optional<car::Reader> reader = openReader(sourcePath);
+    if (reader == ext::nullopt) {
+        fprintf(stderr, "car-writer: failed to open or parse source catalog: %s\n", sourcePath.c_str());
+        return 1;
+    }
+
+    std::remove(outPath.c_str());
+
+    struct bom_context_memory outMemory = bom_context_memory_file(outPath.c_str(), /* writeable */ true, 0);
+    if (outMemory.data == NULL) {
+        fprintf(stderr, "car-writer: failed to open output path for writing: %s\n", outPath.c_str());
+        return 1;
+    }
+
+    UniqueBom outBom = UniqueBom(bom_alloc_empty(outMemory), bom_free);
+    if (outBom == nullptr) {
+        fprintf(stderr, "car-writer: failed to allocate output BOM\n");
+        return 1;
+    }
+
+    ext::optional<car::Writer> writer = car::Writer::Create(std::move(outBom));
+    if (writer == ext::nullopt) {
+        fprintf(stderr, "car-writer: failed to create writer\n");
+        return 1;
+    }
+
+    writer->header() = reader->header();
+    writer->keyfmt() = reader->keyfmt();
+
+    reader->renditionFastIterate([&writer](void *key, size_t keyLen, void *value, size_t valueLen) {
+        writer->addRendition(key, keyLen, value, valueLen);
+    });
+    reader->facetIterate([&writer](car::Facet const &facet) {
+        writer->addFacet(facet);
+    });
+
+    writer->write();
+    car::passthroughUnmanagedVariables(reader->bom(), writer->bom());
+    bom_relocate_trailer(writer->bom());
+
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -364,6 +430,9 @@ int main(int argc, char **argv)
     std::string verb = argv[1];
     std::string sourcePath;
     std::string outPath;
+    std::string iconPath;
+    std::string splashLogoPath;
+    std::string splashBgHex;
 
     for (int i = 2; i + 1 < argc; i += 2) {
         std::string flag = argv[i];
@@ -372,6 +441,12 @@ int main(int argc, char **argv)
             sourcePath = value;
         } else if (flag == "--out") {
             outPath = value;
+        } else if (flag == "--icon-1024") {
+            iconPath = value;
+        } else if (flag == "--splash-logo") {
+            splashLogoPath = value;
+        } else if (flag == "--splash-bg-hex") {
+            splashBgHex = value;
         }
     }
 
@@ -384,6 +459,8 @@ int main(int argc, char **argv)
         return cmdRoundtrip(sourcePath, outPath);
     } else if (verb == "verify") {
         return cmdVerify(sourcePath, outPath);
+    } else if (verb == "patch") {
+        return cmdPatch(sourcePath, iconPath, splashLogoPath, splashBgHex, outPath);
     }
 
     printUsage();
