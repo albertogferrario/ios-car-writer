@@ -187,14 +187,21 @@ size_t identifierIndexFor(struct car_key_format *keyfmt)
  * went through the structured-authoring branch into *brandedKeys, so the
  * tests below can assert byte-identity everywhere else without guessing
  * which keys should differ.
+ *
+ * splashBgHex is threaded through but not yet acted on -- SplashScreenBackground's
+ * own byte-template-patch branch is this plan's Task 2 GREEN step; RED only
+ * needs the parameter to exist so the new failing test below can compile.
  */
 void runPatch(
     Reader const &reader,
     RgbaImage const &iconMaster,
     RgbaImage const &splashLogoMaster,
+    std::string const &splashBgHex,
     std::string const &outputPath,
     std::set<std::string> *brandedKeys)
 {
+    (void)splashBgHex;
+
     std::remove(outputPath.c_str());
     struct bom_context_memory outMemory = bom_context_memory_file(outputPath.c_str(), /* writeable */ true, 0);
     ASSERT_NE(outMemory.data, nullptr);
@@ -284,7 +291,7 @@ struct PatchResult {
  * rule). Returned by value; Reader/ext::optional<Reader> are move-only,
  * matching this shim's usage elsewhere in this file.
  */
-PatchResult patchRealShellFixture(std::string const &outputPath)
+PatchResult patchRealShellFixture(std::string const &outputPath, std::string const &splashBgHex)
 {
     PatchResult result;
 
@@ -306,7 +313,7 @@ PatchResult patchRealShellFixture(std::string const &outputPath)
 
     RgbaImage iconMaster = makeSolidImage(1024, 1024, 10, 20, 30, 255);
     RgbaImage splashLogoMaster = makeSolidImage(64, 64, 200, 100, 50, 128);
-    runPatch(*sourceReader, iconMaster, splashLogoMaster, outputPath, &result.brandedKeys);
+    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.brandedKeys);
 
     struct bom_context_memory sourceMemory2 = bom_context_memory_file(fixturePath.c_str(), false, 0);
     if (sourceMemory2.data == nullptr) {
@@ -331,11 +338,52 @@ PatchResult patchRealShellFixture(std::string const &outputPath)
     return result;
 }
 
+/*
+ * Locate the raw rendition value for a facet by name, using the same
+ * identifier-partition technique as runPatch() above. Returns false if the
+ * facet or a matching rendition is not found -- used by the
+ * SplashScreenBackground test below to independently re-decode the patched
+ * value straight from a re-opened Reader, rather than trusting runPatch()'s
+ * own bookkeeping.
+ */
+bool findRenditionValueByFacetName(Reader const &reader, std::string const &facetName, std::vector<uint8_t> *outValue)
+{
+    ext::optional<Facet> facet = reader.lookupFacet(facetName);
+    if (facet == ext::nullopt) {
+        return false;
+    }
+    ext::optional<uint16_t> facetId = facet->attributes().get(car_attribute_identifier_identifier);
+    if (facetId == ext::nullopt) {
+        return false;
+    }
+    size_t identifierIndex = identifierIndexFor(reader.keyfmt());
+
+    bool found = false;
+    std::vector<uint8_t> value;
+    reader.renditionFastIterate([&](void *key, size_t keyLen, void *rawValue, size_t valueLen) {
+        (void)keyLen;
+        if (found) {
+            return;
+        }
+        car_rendition_key *renditionKey = (car_rendition_key *)key;
+        if (renditionKey[identifierIndex] == *facetId) {
+            uint8_t const *bytes = static_cast<uint8_t const *>(rawValue);
+            value.assign(bytes, bytes + valueLen);
+            found = true;
+        }
+    });
+
+    if (found) {
+        *outValue = value;
+    }
+    return found;
+}
+
 } // namespace
 
 TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
 {
-    PatchResult result = patchRealShellFixture("real_shell_patch_output_bytes.car");
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_bytes.car", kSplashBgNavyHex);
     ASSERT_NE(result.sourceReader, ext::nullopt) << "shell fixture not found or unreadable, or patch setup failed";
     ASSERT_NE(result.outReader, ext::nullopt);
     ASSERT_GT(result.brandedKeys.size(), static_cast<size_t>(0)) << "no rendition was branded -- fixture shape assumption wrong";
@@ -365,7 +413,7 @@ TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
 
 TEST(Patch, BrandedRenditionsAreZlibCompressedNotLzfseOrDeepmap2)
 {
-    PatchResult result = patchRealShellFixture("real_shell_patch_output_zlib.car");
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_zlib.car", kSplashBgNavyHex);
     ASSERT_NE(result.outReader, ext::nullopt);
     ASSERT_GT(result.brandedKeys.size(), static_cast<size_t>(0));
 
@@ -398,7 +446,7 @@ TEST(Patch, BrandedRenditionsAreZlibCompressedNotLzfseOrDeepmap2)
 
 TEST(Patch, OutputHeaderAndKeyformatMatchSourceExactly)
 {
-    PatchResult result = patchRealShellFixture("real_shell_patch_output_header.car");
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_header.car", kSplashBgNavyHex);
     ASSERT_NE(result.sourceReader, ext::nullopt);
     ASSERT_NE(result.outReader, ext::nullopt);
 
@@ -422,7 +470,7 @@ TEST(Patch, OutputHeaderAndKeyformatMatchSourceExactly)
 
 TEST(Patch, FacetAndRenditionCountsArePreserved)
 {
-    PatchResult result = patchRealShellFixture("real_shell_patch_output_counts.car");
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_counts.car", kSplashBgNavyHex);
     ASSERT_NE(result.sourceReader, ext::nullopt);
     ASSERT_NE(result.outReader, ext::nullopt);
 
@@ -432,4 +480,60 @@ TEST(Patch, FacetAndRenditionCountsArePreserved)
     EXPECT_EQ(result.sourceReader->renditionCount(), result.outReader->renditionCount());
 
     std::remove("real_shell_patch_output_counts.car");
+}
+
+/*
+ * SplashScreenBackground has no Rendition::Create()/Decode() branch in this
+ * fork (pixel_format=0, layout=1009) -- it must be re-colored via the raw
+ * byte-template patch (244-03-PLAN.md Task 2). This is a RED test as of the
+ * `test(244-03)` commit: runPatch() does not yet implement the branch, so
+ * the trailing doubles below still decode to the source's own [1,1,1,1]
+ * (white) rather than the navy/orange constants re-verified in Task 1.
+ */
+TEST(Patch, SplashScreenBackgroundIsRecoloredFromHexTemplate)
+{
+    PatchResult navyResult = patchRealShellFixture("real_shell_patch_output_splashbg_navy.car", kSplashBgNavyHex);
+    ASSERT_NE(navyResult.sourceReader, ext::nullopt) << "shell fixture not found or unreadable, or patch setup failed";
+    ASSERT_NE(navyResult.outReader, ext::nullopt);
+
+    std::vector<uint8_t> sourceValue;
+    ASSERT_TRUE(findRenditionValueByFacetName(*navyResult.sourceReader, "SplashScreenBackground", &sourceValue))
+        << "shell fixture has no SplashScreenBackground rendition";
+    ASSERT_EQ(sourceValue.size(), kSplashBgValueLength);
+
+    std::vector<uint8_t> navyValue;
+    ASSERT_TRUE(findRenditionValueByFacetName(*navyResult.outReader, "SplashScreenBackground", &navyValue));
+    ASSERT_EQ(navyValue.size(), kSplashBgValueLength) << "SplashScreenBackground value length must stay fixed at 260 bytes";
+
+    EXPECT_EQ(memcmp(sourceValue.data(), navyValue.data(), kSplashBgDoublesOffset), 0)
+        << "bytes 0-227 of the patched SplashScreenBackground value must stay byte-identical to the source";
+
+    double navyDoubles[4];
+    memcpy(navyDoubles, navyValue.data() + kSplashBgDoublesOffset, sizeof(navyDoubles));
+    for (int i = 0; i < 4; i++) {
+        EXPECT_DOUBLE_EQ(navyDoubles[i], kSplashBgNavyRgba[i]) << "navy component " << i << " mismatch";
+    }
+    EXPECT_NE(memcmp(sourceValue.data(), navyValue.data(), kSplashBgValueLength), 0)
+        << "SplashScreenBackground value unexpectedly unchanged for navy (not branded)";
+
+    PatchResult orangeResult = patchRealShellFixture("real_shell_patch_output_splashbg_orange.car", kSplashBgOrangeHex);
+    ASSERT_NE(orangeResult.outReader, ext::nullopt);
+
+    std::vector<uint8_t> orangeValue;
+    ASSERT_TRUE(findRenditionValueByFacetName(*orangeResult.outReader, "SplashScreenBackground", &orangeValue));
+    ASSERT_EQ(orangeValue.size(), kSplashBgValueLength);
+
+    EXPECT_EQ(memcmp(sourceValue.data(), orangeValue.data(), kSplashBgDoublesOffset), 0)
+        << "bytes 0-227 of the patched SplashScreenBackground value must stay byte-identical to the source";
+
+    double orangeDoubles[4];
+    memcpy(orangeDoubles, orangeValue.data() + kSplashBgDoublesOffset, sizeof(orangeDoubles));
+    for (int i = 0; i < 4; i++) {
+        EXPECT_DOUBLE_EQ(orangeDoubles[i], kSplashBgOrangeRgba[i]) << "orange component " << i << " mismatch";
+    }
+    EXPECT_NE(memcmp(sourceValue.data(), orangeValue.data(), kSplashBgValueLength), 0)
+        << "SplashScreenBackground value unexpectedly unchanged for orange (not branded)";
+
+    std::remove("real_shell_patch_output_splashbg_navy.car");
+    std::remove("real_shell_patch_output_splashbg_orange.car");
 }
