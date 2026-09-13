@@ -50,6 +50,34 @@ namespace {
 
 typedef std::unique_ptr<struct bom_context, decltype(&bom_free)> UniqueBom;
 
+/*
+ * SplashScreenBackground raw value layout (Phase 244 Plan 03 Task 1):
+ * re-verified against the real build-180/181 branded oracles --
+ * `assetutil -I` "Color components" plus a direct byte inspection of the
+ * value at the offsets below -- and confirmed to match the shell-fixture-
+ * derived layout in 244-RESEARCH.md exactly (no actool point-release drift,
+ * Open Question 2 / Assumption A2, RESOLVED):
+ *   - value length is 260 bytes on shell-stock.car and both oracles.
+ *   - the "COLR" payload magic (stored reversed as "RLOC", matching the
+ *     "CTSI"->"ISTC" convention) sits at value-relative offset 212.
+ *   - the four RGBA channels are IEEE-754 little-endian doubles at
+ *     value-relative offset 228-259; bytes 0-227 are byte-identical across
+ *     shell-stock/build-180-navy/build-181-orange.
+ * The navy/orange oracles are a recolored shell-stock.car (only these
+ * trailing 32 bytes differ) -- see tests/fixtures/car-oracles/README.md.
+ * Expected doubles below are derived as #RRGGBB -> [R/255.0, G/255.0,
+ * B/255.0, 1.0] and cross-checked against assetutil's own "Color
+ * components" output for each oracle.
+ */
+constexpr size_t kSplashBgValueLength = 260;
+constexpr size_t kSplashBgDoublesOffset = 228;
+
+std::string const kSplashBgNavyHex = "#001F3F";
+double const kSplashBgNavyRgba[4] = {0.0 / 255.0, 31.0 / 255.0, 63.0 / 255.0, 1.0};
+
+std::string const kSplashBgOrangeHex = "#FF851B";
+double const kSplashBgOrangeRgba[4] = {255.0 / 255.0, 133.0 / 255.0, 27.0 / 255.0, 1.0};
+
 /* A synthetic master image: straight (non-premultiplied) alpha RGBA8. */
 struct RgbaImage {
     std::vector<uint8_t> pixels;
