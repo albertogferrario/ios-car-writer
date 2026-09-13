@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -180,17 +181,65 @@ size_t identifierIndexFor(struct car_key_format *keyfmt)
     return 0;
 }
 
+/* [Duplicated from car_roundtrip.cpp's cmdPatch() helpers -- see this
+ * file's header comment.] Fails closed (returns false) on anything other
+ * than exactly 7 characters, a leading '#', and six hex digits. */
+bool parseHexColor(std::string const &hex, uint8_t *outR, uint8_t *outG, uint8_t *outB)
+{
+    if (hex.size() != 7 || hex[0] != '#') {
+        return false;
+    }
+    for (size_t i = 1; i < 7; i++) {
+        if (!isxdigit(static_cast<unsigned char>(hex[i]))) {
+            return false;
+        }
+    }
+
+    *outR = static_cast<uint8_t>(std::stoul(hex.substr(1, 2), nullptr, 16));
+    *outG = static_cast<uint8_t>(std::stoul(hex.substr(3, 2), nullptr, 16));
+    *outB = static_cast<uint8_t>(std::stoul(hex.substr(5, 2), nullptr, 16));
+    return true;
+}
+
+/* [Duplicated from car_roundtrip.cpp's cmdPatch() helpers -- see this
+ * file's header comment.] Copies the source SplashScreenBackground value
+ * verbatim and overwrites only the trailing four RGBA doubles at
+ * kSplashBgDoublesOffset. Returns false (fail closed, T-244-03-02) if the
+ * source value is not exactly kSplashBgValueLength bytes. */
+bool patchSplashScreenBackgroundValue(void const *sourceValue, size_t sourceValueLen, uint8_t r, uint8_t g, uint8_t b, std::vector<uint8_t> *outValue)
+{
+    if (sourceValueLen != kSplashBgValueLength) {
+        return false;
+    }
+
+    uint8_t const *sourceBytes = static_cast<uint8_t const *>(sourceValue);
+    outValue->assign(sourceBytes, sourceBytes + sourceValueLen);
+
+    double components[4] = {
+        static_cast<double>(r) / 255.0,
+        static_cast<double>(g) / 255.0,
+        static_cast<double>(b) / 255.0,
+        1.0,
+    };
+    /* Little-endian target platforms only (x86_64/ARM64): a double's own
+     * in-memory representation there already matches the little-endian
+     * layout car_format.h documents, so a direct memcpy reproduces it. */
+    memcpy(outValue->data() + kSplashBgDoublesOffset, components, sizeof(components));
+    return true;
+}
+
 /*
  * Mirrors car_roundtrip.cpp's cmdPatch() exactly (identifier-partition,
  * byte-verbatim default arm, structured zlib authoring for AppIcon/
- * SplashScreenLogo). Collects the hex-key of every rendition that actually
- * went through the structured-authoring branch into *brandedKeys, so the
- * tests below can assert byte-identity everywhere else without guessing
- * which keys should differ.
- *
- * splashBgHex is threaded through but not yet acted on -- SplashScreenBackground's
- * own byte-template-patch branch is this plan's Task 2 GREEN step; RED only
- * needs the parameter to exist so the new failing test below can compile.
+ * SplashScreenLogo, raw byte-template patch for SplashScreenBackground).
+ * Collects the hex-key of every AppIcon/SplashScreenLogo rendition (the ones
+ * that went through the structured zlib-authoring branch) into
+ * *zlibBrandedKeys, and every branded key including SplashScreenBackground
+ * into *allBrandedKeys -- kept as two separate sets because
+ * SplashScreenBackground's raw byte-template patch does not produce an MLEC
+ * zlib header the way the other two do (BrandedRenditionsAreZlibCompressed...
+ * below only checks zlibBrandedKeys; the byte-identity test below checks
+ * allBrandedKeys).
  */
 void runPatch(
     Reader const &reader,
@@ -198,9 +247,13 @@ void runPatch(
     RgbaImage const &splashLogoMaster,
     std::string const &splashBgHex,
     std::string const &outputPath,
-    std::set<std::string> *brandedKeys)
+    std::set<std::string> *zlibBrandedKeys,
+    std::set<std::string> *allBrandedKeys)
 {
-    (void)splashBgHex;
+    uint8_t splashR = 0;
+    uint8_t splashG = 0;
+    uint8_t splashB = 0;
+    ASSERT_TRUE(parseHexColor(splashBgHex, &splashR, &splashG, &splashB)) << "malformed --splash-bg-hex: " << splashBgHex;
 
     std::remove(outputPath.c_str());
     struct bom_context_memory outMemory = bom_context_memory_file(outputPath.c_str(), /* writeable */ true, 0);
@@ -219,13 +272,32 @@ void runPatch(
 
     ext::optional<Facet> appIconFacet = reader.lookupFacet("AppIcon");
     ext::optional<Facet> splashLogoFacet = reader.lookupFacet("SplashScreenLogo");
+    ext::optional<Facet> splashBgFacet = reader.lookupFacet("SplashScreenBackground");
     ASSERT_NE(appIconFacet, ext::nullopt) << "shell fixture has no AppIcon facet";
     ASSERT_NE(splashLogoFacet, ext::nullopt) << "shell fixture has no SplashScreenLogo facet";
+    ASSERT_NE(splashBgFacet, ext::nullopt) << "shell fixture has no SplashScreenBackground facet";
 
     ext::optional<uint16_t> appIconId = appIconFacet->attributes().get(car_attribute_identifier_identifier);
     ext::optional<uint16_t> splashLogoId = splashLogoFacet->attributes().get(car_attribute_identifier_identifier);
+    ext::optional<uint16_t> splashBgId = splashBgFacet->attributes().get(car_attribute_identifier_identifier);
     ASSERT_NE(appIconId, ext::nullopt);
     ASSERT_NE(splashLogoId, ext::nullopt);
+    ASSERT_NE(splashBgId, ext::nullopt);
+
+    /*
+     * Writer::addRendition(void*,size_t,void*,size_t) (the raw fast-edit
+     * overload) stores the given pointers verbatim in _rawRenditions and
+     * only dereferences them later, inside write() -- it does not copy the
+     * bytes eagerly (Writer.cpp). Byte-verbatim copies pass pointers into
+     * the SOURCE reader's own mmap, which stays valid for this whole
+     * function's lifetime, so that is safe. A patched SplashScreenBackground
+     * value, however, is a freshly allocated buffer -- it MUST be kept alive
+     * in a scope that outlives the renditionFastIterate lambda (until
+     * writer->write() runs below), never a vector local to a single lambda
+     * invocation, which would already be destroyed by then (dangling
+     * pointer / heap-use-after-free, exactly what this comment prevents).
+     */
+    std::vector<std::vector<uint8_t>> splashBgOwnedValues;
 
     reader.renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
         car_rendition_key *renditionKey = (car_rendition_key *)key;
@@ -233,6 +305,21 @@ void runPatch(
 
         bool isAppIcon = (identifier == *appIconId);
         bool isSplashLogo = (identifier == *splashLogoId);
+        bool isSplashBg = (identifier == *splashBgId);
+
+        if (isSplashBg) {
+            splashBgOwnedValues.emplace_back();
+            std::vector<uint8_t> &patchedValue = splashBgOwnedValues.back();
+            if (patchSplashScreenBackgroundValue(value, valueLen, splashR, splashG, splashB, &patchedValue)) {
+                writer->addRendition(key, keyLen, patchedValue.data(), patchedValue.size());
+                allBrandedKeys->insert(car::bytesToHex(key, keyLen));
+                return;
+            }
+            /* Fail closed (T-244-03-02): unexpected value size -- copy
+             * byte-verbatim rather than guess at a different layout. */
+            writer->addRendition(key, keyLen, value, valueLen);
+            return;
+        }
 
         if (!isAppIcon && !isSplashLogo) {
             writer->addRendition(key, keyLen, value, valueLen);
@@ -266,7 +353,9 @@ void runPatch(
         rendition.fileName() = std::string(sourceValue->metadata.name, strnlen(sourceValue->metadata.name, sizeof(sourceValue->metadata.name)));
 
         writer->addRendition(rendition);
-        brandedKeys->insert(car::bytesToHex(key, keyLen));
+        std::string hexKey = car::bytesToHex(key, keyLen);
+        zlibBrandedKeys->insert(hexKey);
+        allBrandedKeys->insert(hexKey);
     });
 
     reader.facetIterate([&writer](Facet const &facet) {
@@ -281,7 +370,8 @@ void runPatch(
 struct PatchResult {
     ext::optional<Reader> sourceReader;
     ext::optional<Reader> outReader;
-    std::set<std::string> brandedKeys;
+    std::set<std::string> zlibBrandedKeys; /* AppIcon + SplashScreenLogo only. */
+    std::set<std::string> allBrandedKeys;  /* zlibBrandedKeys + SplashScreenBackground. */
 };
 
 /*
@@ -313,7 +403,7 @@ PatchResult patchRealShellFixture(std::string const &outputPath, std::string con
 
     RgbaImage iconMaster = makeSolidImage(1024, 1024, 10, 20, 30, 255);
     RgbaImage splashLogoMaster = makeSolidImage(64, 64, 200, 100, 50, 128);
-    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.brandedKeys);
+    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.zlibBrandedKeys, &result.allBrandedKeys);
 
     struct bom_context_memory sourceMemory2 = bom_context_memory_file(fixturePath.c_str(), false, 0);
     if (sourceMemory2.data == nullptr) {
@@ -386,7 +476,16 @@ TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
     PatchResult result = patchRealShellFixture("real_shell_patch_output_bytes.car", kSplashBgNavyHex);
     ASSERT_NE(result.sourceReader, ext::nullopt) << "shell fixture not found or unreadable, or patch setup failed";
     ASSERT_NE(result.outReader, ext::nullopt);
-    ASSERT_GT(result.brandedKeys.size(), static_cast<size_t>(0)) << "no rendition was branded -- fixture shape assumption wrong";
+    /* Branded keys span 3 facets: AppIcon, SplashScreenLogo (structured
+     * zlib authoring, one key per scale/idiom bucket), SplashScreenBackground
+     * (raw byte-template patch, always exactly one "universal" key). Widened
+     * from the 2-facet exclusion 244-02 established, now that
+     * SplashScreenBackground is also branded (Phase 244 Plan 03) -- the
+     * exact key COUNT depends on how many buckets the fixture's AppIcon/
+     * SplashScreenLogo facets carry, so this asserts the superset
+     * relationship rather than a specific magic number. */
+    ASSERT_GT(result.allBrandedKeys.size(), result.zlibBrandedKeys.size()) << "SplashScreenBackground's own key must have been added on top of the zlib-branded keys";
+    ASSERT_GT(result.zlibBrandedKeys.size(), static_cast<size_t>(0)) << "no rendition was branded -- fixture shape assumption wrong";
 
     std::map<std::string, std::string> sourceHashes;
     result.sourceReader->renditionFastIterate([&sourceHashes](void *key, size_t keyLen, void *value, size_t valueLen) {
@@ -401,7 +500,7 @@ TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
     for (auto const &pair : sourceHashes) {
         auto outIt = outHashes.find(pair.first);
         ASSERT_NE(outIt, outHashes.end()) << "rendition key missing from output: " << pair.first;
-        if (result.brandedKeys.count(pair.first) > 0) {
+        if (result.allBrandedKeys.count(pair.first) > 0) {
             EXPECT_NE(pair.second, outIt->second) << "branded rendition " << pair.first << " unexpectedly unchanged";
         } else {
             EXPECT_EQ(pair.second, outIt->second) << "untouched rendition " << pair.first << " unexpectedly changed";
@@ -415,13 +514,17 @@ TEST(Patch, BrandedRenditionsAreZlibCompressedNotLzfseOrDeepmap2)
 {
     PatchResult result = patchRealShellFixture("real_shell_patch_output_zlib.car", kSplashBgNavyHex);
     ASSERT_NE(result.outReader, ext::nullopt);
-    ASSERT_GT(result.brandedKeys.size(), static_cast<size_t>(0));
+    /* AppIcon + SplashScreenLogo buckets only -- SplashScreenBackground's
+     * raw byte-template patch has no MLEC/zlib header at all, so it must
+     * not be included here (it is covered separately by
+     * SplashScreenBackgroundIsRecoloredFromHexTemplate below). */
+    ASSERT_GT(result.zlibBrandedKeys.size(), static_cast<size_t>(0));
 
     size_t checked = 0;
     result.outReader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
         (void)valueLen;
         std::string hexKey = car::bytesToHex(key, keyLen);
-        if (result.brandedKeys.find(hexKey) == result.brandedKeys.end()) {
+        if (result.zlibBrandedKeys.find(hexKey) == result.zlibBrandedKeys.end()) {
             return;
         }
         checked++;
@@ -439,7 +542,7 @@ TEST(Patch, BrandedRenditionsAreZlibCompressedNotLzfseOrDeepmap2)
             << "branded rendition " << hexKey << " unexpectedly uses LZFSE";
     });
 
-    EXPECT_EQ(checked, result.brandedKeys.size()) << "not every branded key was found during the output iteration";
+    EXPECT_EQ(checked, result.zlibBrandedKeys.size()) << "not every branded key was found during the output iteration";
 
     std::remove("real_shell_patch_output_zlib.car");
 }
@@ -484,11 +587,9 @@ TEST(Patch, FacetAndRenditionCountsArePreserved)
 
 /*
  * SplashScreenBackground has no Rendition::Create()/Decode() branch in this
- * fork (pixel_format=0, layout=1009) -- it must be re-colored via the raw
- * byte-template patch (244-03-PLAN.md Task 2). This is a RED test as of the
- * `test(244-03)` commit: runPatch() does not yet implement the branch, so
- * the trailing doubles below still decode to the source's own [1,1,1,1]
- * (white) rather than the navy/orange constants re-verified in Task 1.
+ * fork (pixel_format=0, layout=1009) -- it is re-colored via the raw
+ * byte-template patch (244-03-PLAN.md Task 2), never the structured
+ * authoring path used for AppIcon/SplashScreenLogo.
  */
 TEST(Patch, SplashScreenBackgroundIsRecoloredFromHexTemplate)
 {

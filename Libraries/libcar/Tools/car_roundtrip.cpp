@@ -33,10 +33,12 @@
  *                     --out <out.car>
  *     -> exit 0 on success; reproduces roundtrip's full BOM re-serialization
  *        but substitutes the AppIcon and SplashScreenLogo renditions with
- *        zlib-encoded content resampled from the supplied PNG masters,
- *        while copying every other rendition (including
- *        SplashScreenBackground, patched separately in Phase 244 Plan 03)
- *        byte-verbatim (244-02-PLAN.md, D-01/D-02/D-03).
+ *        zlib-encoded content resampled from the supplied PNG masters, and
+ *        re-colors SplashScreenBackground's own 260-byte value via a raw
+ *        byte-template patch of its trailing four RGBA doubles (offset
+ *        228-259) derived from --splash-bg-hex (244-03-PLAN.md, D-07), while
+ *        copying every other rendition byte-verbatim (244-02-PLAN.md,
+ *        D-01/D-02/D-03).
  *
  *        Rendition selection uses the same identifier-partition technique
  *        Reader::Load() already uses internally (Sources/Reader.cpp): the
@@ -64,6 +66,7 @@
 #include <png.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -580,12 +583,89 @@ size_t identifierIndexFor(struct car_key_format *keyfmt)
 }
 
 /*
+ * Parse a `#RRGGBB` hex color string into three bytes. Fails closed (returns
+ * false) on anything other than exactly 7 characters, a leading '#', and six
+ * hex digits -- T-244-03-01. car-writer's --splash-bg-hex reaches this
+ * function as plain process argv (never shell-interpolated), but a
+ * malformed value must still never reach the buffer-write step below.
+ */
+bool parseHexColor(std::string const &hex, uint8_t *outR, uint8_t *outG, uint8_t *outB)
+{
+    if (hex.size() != 7 || hex[0] != '#') {
+        return false;
+    }
+    for (size_t i = 1; i < 7; i++) {
+        if (!isxdigit(static_cast<unsigned char>(hex[i]))) {
+            return false;
+        }
+    }
+
+    *outR = static_cast<uint8_t>(std::stoul(hex.substr(1, 2), nullptr, 16));
+    *outG = static_cast<uint8_t>(std::stoul(hex.substr(3, 2), nullptr, 16));
+    *outB = static_cast<uint8_t>(std::stoul(hex.substr(5, 2), nullptr, 16));
+    return true;
+}
+
+/*
+ * SplashScreenBackground's fixed 260-byte value layout (byte-verified on the
+ * shell fixture and re-confirmed against the real build-180/181 branded
+ * oracles, 244-03-PLAN.md Task 1 / <interfaces>): bytes 0-227 are the CTSI
+ * header + info-list + "COLR" payload header, unchanged across every color
+ * variant observed; bytes 228-259 are four IEEE-754 little-endian doubles
+ * (R, G, B, A).
+ */
+constexpr size_t kSplashBgValueLength = 260;
+constexpr size_t kSplashBgDoublesOffset = 228;
+
+/*
+ * Copy the source SplashScreenBackground value verbatim and overwrite only
+ * the trailing four RGBA doubles. Returns false (fail closed, T-244-03-02)
+ * if the source value is not exactly kSplashBgValueLength bytes -- callers
+ * must fall back to a byte-verbatim copy of the untouched source value in
+ * that case, matching the AppIcon/SplashScreenLogo missing-master fallback
+ * below, rather than reading or writing past a differently-shaped buffer.
+ */
+bool patchSplashScreenBackgroundValue(
+    void const *sourceValue,
+    size_t sourceValueLen,
+    uint8_t r,
+    uint8_t g,
+    uint8_t b,
+    std::vector<uint8_t> *outValue)
+{
+    if (sourceValueLen != kSplashBgValueLength) {
+        return false;
+    }
+
+    uint8_t const *sourceBytes = static_cast<uint8_t const *>(sourceValue);
+    outValue->assign(sourceBytes, sourceBytes + sourceValueLen);
+
+    double components[4] = {
+        static_cast<double>(r) / 255.0,
+        static_cast<double>(g) / 255.0,
+        static_cast<double>(b) / 255.0,
+        1.0,
+    };
+    /* This fork targets little-endian platforms only (x86_64/ARM64); a
+     * double's in-memory representation there already matches the
+     * little-endian layout car_format.h documents, so a direct memcpy
+     * reproduces it without a manual byte-swap. */
+    memcpy(outValue->data() + kSplashBgDoublesOffset, components, sizeof(components));
+    return true;
+}
+
+/*
  * car-writer patch: reproduces cmdRoundtrip()'s full BOM re-serialization
  * but substitutes the AppIcon and SplashScreenLogo renditions with fresh
  * zlib-encoded content resampled from the supplied PNG masters (Phase 244
- * Plan 02, D-01/D-02/D-03). SplashScreenBackground and every other
- * rendition stay byte-verbatim in THIS plan -- SplashScreenBackground's own
- * byte-template-patch branch is Phase 244 Plan 03.
+ * Plan 02, D-01/D-02/D-03), and re-colors SplashScreenBackground's own
+ * 260-byte value via a raw byte-template patch of its trailing four RGBA
+ * doubles (Phase 244 Plan 03, D-07) -- SplashScreenBackground has no
+ * Rendition::Create()/Decode() branch in this fork (pixel_format=0,
+ * layout=1009), so it goes through the same raw fast-edit
+ * addRendition(void*,size_t,void*,size_t) overload used for byte-verbatim
+ * copies, never the structured authoring path. Every other rendition stays
+ * byte-verbatim.
  */
 int cmdPatch(
     std::string const &sourcePath,
@@ -594,7 +674,15 @@ int cmdPatch(
     std::string const &splashBgHex,
     std::string const &outPath)
 {
-    (void)splashBgHex; /* SplashScreenBackground substitution is Plan 03. */
+    /* T-244-03-01: validate before any file I/O -- a malformed hex must
+     * never reach the buffer-write step below. */
+    uint8_t splashR = 0;
+    uint8_t splashG = 0;
+    uint8_t splashB = 0;
+    if (!parseHexColor(splashBgHex, &splashR, &splashG, &splashB)) {
+        fprintf(stderr, "car-writer: --splash-bg-hex must be a well-formed #RRGGBB hex color (got: \"%s\")\n", splashBgHex.c_str());
+        return 1;
+    }
 
     ext::optional<car::Reader> reader = openReader(sourcePath);
     if (reader == ext::nullopt) {
@@ -629,12 +717,15 @@ int cmdPatch(
 
     size_t identifierIndex = identifierIndexFor(reader->keyfmt());
 
-    /* Look up all three branded facets by name, as the CLI contract and
-     * Plan 03's structural symmetry require -- SplashScreenBackground's
-     * identifier is not branched on in THIS plan (it stays byte-verbatim
-     * like everything else not named AppIcon/SplashScreenLogo), but the
-     * lookup itself is unconditional so a missing branded facet on a future
-     * shell is visible during development rather than silently ignored. */
+    /* Look up all three branded facets by name (Phase 244 Plan 02 established
+     * the identifier-partition technique for AppIcon/SplashScreenLogo; Plan 03
+     * adds SplashScreenBackground's own branch below via the raw
+     * byte-template patch path, since it has no Rendition::Create()/
+     * Decode() support in this fork -- Pattern: "SplashScreenBackground is
+     * authored via raw-template patch", 244-RESEARCH.md). If a branded
+     * facet is missing on a future shell, its id stays ext::nullopt and the
+     * corresponding branch below never matches, falling through to the
+     * byte-verbatim default -- visible during development, never a crash. */
     ext::optional<car::Facet> appIconFacet = reader->lookupFacet("AppIcon");
     ext::optional<car::Facet> splashLogoFacet = reader->lookupFacet("SplashScreenLogo");
     ext::optional<car::Facet> splashBgFacet = reader->lookupFacet("SplashScreenBackground");
@@ -642,7 +733,6 @@ int cmdPatch(
     ext::optional<uint16_t> appIconId = appIconFacet ? appIconFacet->attributes().get(car_attribute_identifier_identifier) : ext::nullopt;
     ext::optional<uint16_t> splashLogoId = splashLogoFacet ? splashLogoFacet->attributes().get(car_attribute_identifier_identifier) : ext::nullopt;
     ext::optional<uint16_t> splashBgId = splashBgFacet ? splashBgFacet->attributes().get(car_attribute_identifier_identifier) : ext::nullopt;
-    (void)splashBgId;
 
     /* Decode each branded master once, up front. Never touch a SOURCE
      * rendition's pixel data below (Pitfall A: no LZFSE/deepmap2 decode path
@@ -654,16 +744,44 @@ int cmdPatch(
     RgbaImage splashLogoMaster;
     bool haveSplashLogoMaster = decodePng(splashLogoPath, &splashLogoMaster);
 
+    /* Writer::addRendition(void*,size_t,void*,size_t) (the raw fast-edit
+     * overload) stores the given pointers verbatim and only dereferences
+     * them later, inside write() below -- it does not copy the bytes
+     * eagerly (Writer.cpp). Byte-verbatim copies pass pointers into the
+     * SOURCE reader's own mmap, which stays valid for this whole function's
+     * lifetime, so that is safe. A patched SplashScreenBackground value is a
+     * freshly allocated buffer, so it MUST be kept alive in a scope that
+     * outlives the renditionFastIterate lambda (until writer->write() runs
+     * below) -- never a buffer local to a single lambda invocation, which
+     * would already be destroyed by then (dangling pointer). */
+    std::vector<std::vector<uint8_t>> splashBgOwnedValues;
+
     reader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
         car_rendition_key *renditionKey = (car_rendition_key *)key;
         uint16_t identifier = renditionKey[identifierIndex];
 
         bool isAppIcon = appIconId && identifier == *appIconId;
         bool isSplashLogo = splashLogoId && identifier == *splashLogoId;
+        bool isSplashBg = splashBgId && identifier == *splashBgId;
+
+        if (isSplashBg) {
+            splashBgOwnedValues.emplace_back();
+            std::vector<uint8_t> &patchedValue = splashBgOwnedValues.back();
+            if (patchSplashScreenBackgroundValue(value, valueLen, splashR, splashG, splashB, &patchedValue)) {
+                writer->addRendition(key, keyLen, patchedValue.data(), patchedValue.size());
+                return;
+            }
+            /* Fail closed (T-244-03-02): unexpected value size means this
+             * is not the fixed-260-byte template this research
+             * reverse-engineered -- copy byte-verbatim rather than guess at
+             * a different layout, matching the missing-master fallback
+             * below. */
+            writer->addRendition(key, keyLen, value, valueLen);
+            return;
+        }
 
         if (!isAppIcon && !isSplashLogo) {
-            /* Byte-verbatim: every other rendition, including
-             * SplashScreenBackground (D-01/WRITER-03). */
+            /* Byte-verbatim: every other rendition. */
             writer->addRendition(key, keyLen, value, valueLen);
             return;
         }
