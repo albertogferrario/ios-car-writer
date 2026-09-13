@@ -248,7 +248,9 @@ void runPatch(
     std::string const &splashBgHex,
     std::string const &outputPath,
     std::set<std::string> *zlibBrandedKeys,
-    std::set<std::string> *allBrandedKeys)
+    std::set<std::string> *allBrandedKeys,
+    std::set<std::string> *appIconKeys,
+    std::set<std::string> *splashLogoKeys)
 {
     uint8_t splashR = 0;
     uint8_t splashG = 0;
@@ -356,6 +358,11 @@ void runPatch(
         std::string hexKey = car::bytesToHex(key, keyLen);
         zlibBrandedKeys->insert(hexKey);
         allBrandedKeys->insert(hexKey);
+        if (isAppIcon) {
+            appIconKeys->insert(hexKey);
+        } else {
+            splashLogoKeys->insert(hexKey);
+        }
     });
 
     reader.facetIterate([&writer](Facet const &facet) {
@@ -372,6 +379,8 @@ struct PatchResult {
     ext::optional<Reader> outReader;
     std::set<std::string> zlibBrandedKeys; /* AppIcon + SplashScreenLogo only. */
     std::set<std::string> allBrandedKeys;  /* zlibBrandedKeys + SplashScreenBackground. */
+    std::set<std::string> appIconKeys;     /* Structured-authoring AppIcon buckets only. */
+    std::set<std::string> splashLogoKeys;  /* Structured-authoring SplashScreenLogo buckets only. */
 };
 
 /*
@@ -403,7 +412,7 @@ PatchResult patchRealShellFixture(std::string const &outputPath, std::string con
 
     RgbaImage iconMaster = makeSolidImage(1024, 1024, 10, 20, 30, 255);
     RgbaImage splashLogoMaster = makeSolidImage(64, 64, 200, 100, 50, 128);
-    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.zlibBrandedKeys, &result.allBrandedKeys);
+    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.zlibBrandedKeys, &result.allBrandedKeys, &result.appIconKeys, &result.splashLogoKeys);
 
     struct bom_context_memory sourceMemory2 = bom_context_memory_file(fixturePath.c_str(), false, 0);
     if (sourceMemory2.data == nullptr) {
@@ -545,6 +554,57 @@ TEST(Patch, BrandedRenditionsAreZlibCompressedNotLzfseOrDeepmap2)
     EXPECT_EQ(checked, result.zlibBrandedKeys.size()) << "not every branded key was found during the output iteration";
 
     std::remove("real_shell_patch_output_zlib.car");
+}
+
+/*
+ * ITMS-90717 fix anchor (Phase 246 Plan 01): Apple's actool marks the App
+ * Store icon rendition's CELM data-header (car_rendition_data_header1) low
+ * flags bits 0x3 (opaque compressed-data container), matching an on-disk
+ * is_opaque bit of 0 -- this is the container-level discriminator that
+ * clears ITMS-90717, independent of the ARGB pixel format underneath. The
+ * override is scoped to AppIcon ONLY (D-03, safety-tested): SplashScreenLogo
+ * must keep flags 0x0, or its legitimate transparency is destroyed.
+ */
+TEST(Patch, AppIconRenditionCarriesOpaqueCelmFlagsSplashLogoDoesNot)
+{
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_celm_flags.car", kSplashBgNavyHex);
+    ASSERT_NE(result.outReader, ext::nullopt);
+    ASSERT_GT(result.appIconKeys.size(), static_cast<size_t>(0)) << "no AppIcon rendition went through structured authoring";
+    ASSERT_GT(result.splashLogoKeys.size(), static_cast<size_t>(0)) << "no SplashScreenLogo rendition went through structured authoring";
+
+    size_t checkedAppIcon = 0;
+    size_t checkedSplashLogo = 0;
+    result.outReader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
+        (void)valueLen;
+        std::string hexKey = car::bytesToHex(key, keyLen);
+        bool isAppIconKey = result.appIconKeys.find(hexKey) != result.appIconKeys.end();
+        bool isSplashLogoKey = result.splashLogoKeys.find(hexKey) != result.splashLogoKeys.end();
+        if (!isAppIconKey && !isSplashLogoKey) {
+            return;
+        }
+
+        struct car_rendition_value *renditionValue = (struct car_rendition_value *)value;
+        struct car_rendition_data_header1 *header1 = (struct car_rendition_data_header1 *)(
+            (uintptr_t)renditionValue + sizeof(struct car_rendition_value) + renditionValue->info_len);
+
+        EXPECT_EQ(std::string(header1->magic, 4), "MLEC") << "rendition " << hexKey << " has a malformed data header";
+        EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_zlib))
+            << "rendition " << hexKey << " is not zlib-compressed";
+
+        uint32_t flags = header1->flags.unknown1 | (header1->flags.unknown2 << 1);
+        if (isAppIconKey) {
+            checkedAppIcon++;
+            EXPECT_EQ(flags, static_cast<uint32_t>(0x3)) << "AppIcon rendition " << hexKey << " must carry the opaque CELM container flags 0x3";
+        } else {
+            checkedSplashLogo++;
+            EXPECT_EQ(flags, static_cast<uint32_t>(0x0)) << "SplashScreenLogo rendition " << hexKey << " must keep flags 0x0 -- the AppIcon-only fix must not leak onto it";
+        }
+    });
+
+    EXPECT_EQ(checkedAppIcon, result.appIconKeys.size()) << "not every AppIcon key was found during the output iteration";
+    EXPECT_EQ(checkedSplashLogo, result.splashLogoKeys.size()) << "not every SplashScreenLogo key was found during the output iteration";
+
+    std::remove("real_shell_patch_output_celm_flags.car");
 }
 
 TEST(Patch, OutputHeaderAndKeyformatMatchSourceExactly)
