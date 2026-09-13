@@ -38,10 +38,8 @@ install(TARGETS car DESTINATION usr/lib)
 # The `patch` verb's AppIcon/SplashScreenLogo master-PNG decode (D-03) is a
 # dependency of THIS tool only -- the reusable `car` library above stays
 # raw-byte-copy-only, no image codec (see this file's original trimmed-fork
-# comment). NOTE: the Alpine static-musl release build (.github/workflows/
-# release.yml) does not yet install libpng-dev/libpng-static -- that update,
-# plus the .do/Dockerfile pin bump, is Phase 245 (this plan builds/tests
-# locally only, no release cut).
+# comment). The Alpine static-musl release build (.github/workflows/release.yml)
+# installs libpng-dev/libpng-static and links libpng statically.
 find_package(PNG REQUIRED)
 
 add_executable(car_roundtrip Tools/car_roundtrip.cpp)

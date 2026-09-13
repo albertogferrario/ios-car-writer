@@ -5,8 +5,9 @@
 # container (matching .do/Dockerfile's own base OS -- no glibc/musl ABI
 # mismatch is possible), gates on a green GoogleTest run (ctest), and
 # verifies the linked binary is actually static before anything else runs.
-# zlib is the only real build dependency (see Libraries/libcar/CMakeLists.txt
-# -- no libpng/libxml2 link is required).
+# zlib and libpng are the build dependencies (see Libraries/libcar/CMakeLists.txt
+# -- the `patch` verb decodes master PNGs; both are linked statically, no
+# libxml2 link is required).
 #
 # Triggered by a pinned tag push or manual dispatch.
 #
@@ -31,18 +32,28 @@ jobs:
         shell: sh
     steps:
       - name: Install build dependencies
-        run: apk add --no-cache build-base cmake zlib-dev zlib-static git file
+        run: apk add --no-cache build-base cmake zlib-dev zlib-static libpng-dev libpng-static git file
 
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Configure (static link, tests on)
         run: |
+          # Resolve libpng's static archive + header dir (musl/Alpine layout).
+          # Pinning the .a is required: FindPNG defaults to the .so, which a
+          # fully static (-static) link cannot consume.
+          PNG_STATIC=$(ls /usr/lib/libpng16.a /usr/lib/libpng.a 2>/dev/null | head -1)
+          test -n "$PNG_STATIC" || { echo "libpng static archive not found"; exit 1; }
+          PNG_INCLUDE=$(dirname "$(find /usr/include -name png.h | head -1)")
+          test -n "$PNG_INCLUDE" || { echo "png.h not found"; exit 1; }
+          echo "Using PNG_LIBRARY=$PNG_STATIC PNG_PNG_INCLUDE_DIR=$PNG_INCLUDE"
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DZLIB_LIBRARY=/lib/libz.a \
             -DZLIB_INCLUDE_DIR=/usr/include \
+            -DPNG_LIBRARY="$PNG_STATIC" \
+            -DPNG_PNG_INCLUDE_DIR="$PNG_INCLUDE" \
             -DBUILD_TESTING=ON \
             .
 
