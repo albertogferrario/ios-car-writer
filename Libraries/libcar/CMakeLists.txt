@@ -54,8 +54,10 @@ if (BUILD_TESTING)
   ADD_UNIT_GTEST(car Rendition Tests/test_Rendition.cpp)
   ADD_UNIT_GTEST(car AttributeList Tests/test_AttributeList.cpp)
   ADD_UNIT_GTEST(car Writer Tests/test_Writer.cpp)
+  ADD_UNIT_GTEST(car Patch Tests/test_Patch.cpp)
 
-  # Lets the real-shell-catalog round-trip test (test_Writer.cpp) locate the
-  # checked-in fixture regardless of ctest's working directory.
+  # Lets the real-shell-catalog tests (test_Writer.cpp, test_Patch.cpp)
+  # locate the checked-in fixture regardless of ctest's working directory.
   target_compile_definitions(test_car_Writer PRIVATE CAR_ROUNDTRIP_REPO_ROOT="${CMAKE_SOURCE_DIR}")
+  target_compile_definitions(test_car_Patch PRIVATE CAR_ROUNDTRIP_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 endif ()
