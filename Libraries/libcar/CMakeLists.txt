@@ -33,10 +33,20 @@ target_link_libraries(car PUBLIC ext bom ${COMPRESSION})
 target_include_directories(car PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Headers")
 install(TARGETS car DESTINATION usr/lib)
 
-# car_roundtrip: the roundtrip/verify CLI (Phase 243 Plan 02), wiring
-# Reader -> Writer end to end. See Tools/car_roundtrip.cpp.
+# car_roundtrip: the roundtrip/verify/patch CLI (Phase 243 Plan 02, Phase 244
+# Plan 02), wiring Reader -> Writer end to end. See Tools/car_roundtrip.cpp.
+# The `patch` verb's AppIcon/SplashScreenLogo master-PNG decode (D-03) is a
+# dependency of THIS tool only -- the reusable `car` library above stays
+# raw-byte-copy-only, no image codec (see this file's original trimmed-fork
+# comment). NOTE: the Alpine static-musl release build (.github/workflows/
+# release.yml) does not yet install libpng-dev/libpng-static -- that update,
+# plus the .do/Dockerfile pin bump, is Phase 245 (this plan builds/tests
+# locally only, no release cut).
+find_package(PNG REQUIRED)
+
 add_executable(car_roundtrip Tools/car_roundtrip.cpp)
-target_link_libraries(car_roundtrip PRIVATE car)
+target_include_directories(car_roundtrip PRIVATE ${PNG_INCLUDE_DIRS})
+target_link_libraries(car_roundtrip PRIVATE car ${PNG_LIBRARIES})
 install(TARGETS car_roundtrip DESTINATION usr/bin)
 
 if (BUILD_TESTING)

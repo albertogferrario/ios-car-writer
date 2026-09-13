@@ -28,16 +28,43 @@
  *     -> exit 0 iff header/KEYFORMAT/per-rendition-SHA-256/FACETKEYS/full
  *        top-level-variable-name-set are all consistent between the two
  *        files; non-zero + a JSON summary on stdout otherwise.
+ *   car-writer patch --source <in.car> --icon-1024 <master.png>
+ *                     --splash-logo <logo.png> --splash-bg-hex '#RRGGBB'
+ *                     --out <out.car>
+ *     -> exit 0 on success; reproduces roundtrip's full BOM re-serialization
+ *        but substitutes the AppIcon and SplashScreenLogo renditions with
+ *        zlib-encoded content resampled from the supplied PNG masters,
+ *        while copying every other rendition (including
+ *        SplashScreenBackground, patched separately in Phase 244 Plan 03)
+ *        byte-verbatim (244-02-PLAN.md, D-01/D-02/D-03).
+ *
+ *        Rendition selection uses the same identifier-partition technique
+ *        Reader::Load() already uses internally (Sources/Reader.cpp): the
+ *        three branded facets' identifiers are looked up via
+ *        lookupFacet(name)->attributes().get(car_attribute_identifier_
+ *        identifier), and identifier_index is derived from the live
+ *        KEYFORMAT every time -- never hardcoded. Only a source rendition's
+ *        plain header-struct fields (width/height/attributes/layout/flags)
+ *        are ever read; `.data()`/Decode() is never called on a source
+ *        rendition -- the Linux build has no LZFSE/deepmap2 decode path at
+ *        all (compile-time __APPLE__ guard in Rendition.cpp), and this tool
+ *        only ever needs the header facts, never the pixel bytes, to
+ *        reproduce the shell's own bucket set (D-03).
  */
 
 #include <car/Reader.h>
 #include <car/Writer.h>
 #include <car/Facet.h>
+#include <car/Rendition.h>
 #include <car/car_format.h>
 #include <car/sha256.h>
 #include <car/VariablePassthrough.h>
 #include <bom/bom.h>
 
+#include <png.h>
+
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -354,15 +381,211 @@ int cmdVerify(std::string const &sourcePath, std::string const &outPath)
 }
 
 /*
+ * A decoded PNG: straight (non-premultiplied) alpha RGBA8, row-major, one
+ * byte per channel. Intentionally the only pixel representation this file
+ * needs -- it is fed directly to resizeRgba()/toPremultipliedBGRA8() below.
+ */
+struct RgbaImage {
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+/*
+ * Decode a PNG file into a straight-alpha RGBA8 buffer, normalizing every
+ * PNG color type (palette/gray/gray+alpha/RGB/RGBA, any bit depth) to 8-bit
+ * RGBA via libpng's own transform pipeline. Returns false on any failure
+ * (missing file, bad signature, decode error) -- callers must fail closed
+ * (fall back to a byte-verbatim copy of the rendition) rather than author a
+ * structured rendition from garbage pixel data.
+ */
+bool decodePng(std::string const &path, RgbaImage *out)
+{
+    FILE *fp = fopen(path.c_str(), "rb");
+    if (fp == NULL) {
+        return false;
+    }
+
+    png_byte signature[8];
+    if (fread(signature, 1, 8, fp) != 8 || png_sig_cmp(signature, 0, 8) != 0) {
+        fclose(fp);
+        return false;
+    }
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (png == NULL) {
+        fclose(fp);
+        return false;
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (info == NULL) {
+        png_destroy_read_struct(&png, NULL, NULL);
+        fclose(fp);
+        return false;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(fp);
+        return false;
+    }
+
+    png_init_io(png, fp);
+    png_set_sig_bytes(png, 8);
+    png_read_info(png, info);
+
+    png_uint_32 width = png_get_image_width(png, info);
+    png_uint_32 height = png_get_image_height(png, info);
+    png_byte colorType = png_get_color_type(png, info);
+    png_byte bitDepth = png_get_bit_depth(png, info);
+
+    if (bitDepth == 16) {
+        png_set_strip_16(png);
+    }
+    if (colorType == PNG_COLOR_TYPE_PALETTE) {
+        png_set_palette_to_rgb(png);
+    }
+    if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8) {
+        png_set_expand_gray_1_2_4_to_8(png);
+    }
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) {
+        png_set_tRNS_to_alpha(png);
+    }
+    if (colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        png_set_gray_to_rgb(png);
+    }
+    if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_PALETTE) {
+        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    }
+
+    png_read_update_info(png, info);
+
+    out->width = width;
+    out->height = height;
+    out->pixels.assign(static_cast<size_t>(width) * height * 4, 0);
+
+    std::vector<png_bytep> rows(height);
+    for (png_uint_32 y = 0; y < height; y++) {
+        rows[y] = out->pixels.data() + static_cast<size_t>(y) * width * 4;
+    }
+    png_read_image(png, rows.data());
+
+    png_destroy_read_struct(&png, &info, NULL);
+    fclose(fp);
+
+    return width > 0 && height > 0;
+}
+
+/*
+ * Bilinear-resample an RGBA8 buffer to an exact target size. D-03: the
+ * writer -- not PHP -- derives every AppIcon/SplashScreenLogo bucket from
+ * the single supplied master, matching each existing shell rendition's own
+ * width/height exactly (read from the SOURCE rendition's header fields by
+ * the caller, never from a hardcoded size list).
+ */
+RgbaImage resizeRgba(RgbaImage const &source, uint32_t targetWidth, uint32_t targetHeight)
+{
+    RgbaImage output;
+    output.width = targetWidth;
+    output.height = targetHeight;
+    output.pixels.assign(static_cast<size_t>(targetWidth) * targetHeight * 4, 0);
+
+    if (source.width == 0 || source.height == 0 || targetWidth == 0 || targetHeight == 0) {
+        return output;
+    }
+
+    if (source.width == targetWidth && source.height == targetHeight) {
+        output.pixels = source.pixels;
+        return output;
+    }
+
+    for (uint32_t y = 0; y < targetHeight; y++) {
+        double srcY = (targetHeight > 1) ? (static_cast<double>(y) * (source.height - 1) / (targetHeight - 1)) : 0.0;
+        uint32_t y0 = static_cast<uint32_t>(srcY);
+        uint32_t y1 = std::min(y0 + 1, source.height - 1);
+        double fy = srcY - y0;
+
+        for (uint32_t x = 0; x < targetWidth; x++) {
+            double srcX = (targetWidth > 1) ? (static_cast<double>(x) * (source.width - 1) / (targetWidth - 1)) : 0.0;
+            uint32_t x0 = static_cast<uint32_t>(srcX);
+            uint32_t x1 = std::min(x0 + 1, source.width - 1);
+            double fx = srcX - x0;
+
+            for (int channel = 0; channel < 4; channel++) {
+                double p00 = source.pixels[(static_cast<size_t>(y0) * source.width + x0) * 4 + channel];
+                double p10 = source.pixels[(static_cast<size_t>(y0) * source.width + x1) * 4 + channel];
+                double p01 = source.pixels[(static_cast<size_t>(y1) * source.width + x0) * 4 + channel];
+                double p11 = source.pixels[(static_cast<size_t>(y1) * source.width + x1) * 4 + channel];
+                double top = p00 + (p10 - p00) * fx;
+                double bottom = p01 + (p11 - p01) * fx;
+                double value = top + (bottom - top) * fy;
+                output.pixels[(static_cast<size_t>(y) * targetWidth + x) * 4 + channel] = static_cast<uint8_t>(value + 0.5);
+            }
+        }
+    }
+
+    return output;
+}
+
+/*
+ * Convert straight-alpha RGBA8 to premultiplied BGRA8 -- the interleaved
+ * byte order car::Rendition::Data::Format::PremultipliedBGRA8 expects
+ * (RESEARCH.md Pitfall 4).
+ */
+std::vector<uint8_t> toPremultipliedBGRA8(RgbaImage const &image)
+{
+    std::vector<uint8_t> output(image.pixels.size());
+    for (size_t i = 0; i + 3 < image.pixels.size(); i += 4) {
+        uint8_t r = image.pixels[i + 0];
+        uint8_t g = image.pixels[i + 1];
+        uint8_t b = image.pixels[i + 2];
+        uint8_t a = image.pixels[i + 3];
+
+        output[i + 0] = static_cast<uint8_t>((static_cast<uint32_t>(b) * a + 127) / 255);
+        output[i + 1] = static_cast<uint8_t>((static_cast<uint32_t>(g) * a + 127) / 255);
+        output[i + 2] = static_cast<uint8_t>((static_cast<uint32_t>(r) * a + 127) / 255);
+        output[i + 3] = a;
+    }
+    return output;
+}
+
+/* True iff every pixel's alpha channel is fully opaque (255). */
+bool isFullyOpaque(RgbaImage const &image)
+{
+    for (size_t i = 3; i < image.pixels.size(); i += 4) {
+        if (image.pixels[i] != 255) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * The index into a raw rendition key (an array of car_rendition_key, i.e.
+ * uint16_t, one per KEYFORMAT-declared identifier, in KEYFORMAT order)
+ * where the FACET identifier lives. Derived from the live KEYFORMAT every
+ * time, exactly as Reader::Load() does internally (Sources/Reader.cpp) --
+ * never hardcoded, since a future shell rebuild could reorder KEYFORMAT
+ * tokens.
+ */
+size_t identifierIndexFor(struct car_key_format *keyfmt)
+{
+    for (size_t i = 0; i < keyfmt->num_identifiers; i++) {
+        if (keyfmt->identifier_list[i] == car_attribute_identifier_identifier) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/*
  * car-writer patch: reproduces cmdRoundtrip()'s full BOM re-serialization
- * but substitutes exactly the AppIcon and SplashScreenLogo renditions with
- * fresh content derived from the supplied PNG inputs (Phase 244 Plan 02).
- * SplashScreenBackground and every other rendition stay byte-verbatim in
- * THIS commit -- the branding logic itself lands in a follow-up commit on
- * this same plan; at this point cmdPatch is behaviorally identical to
- * cmdRoundtrip. --icon-1024/--splash-logo/--splash-bg-hex are accepted but
- * unused here so the CLI surface is stable before the branding logic wires
- * into it.
+ * but substitutes the AppIcon and SplashScreenLogo renditions with fresh
+ * zlib-encoded content resampled from the supplied PNG masters (Phase 244
+ * Plan 02, D-01/D-02/D-03). SplashScreenBackground and every other
+ * rendition stay byte-verbatim in THIS plan -- SplashScreenBackground's own
+ * byte-template-patch branch is Phase 244 Plan 03.
  */
 int cmdPatch(
     std::string const &sourcePath,
@@ -371,9 +594,7 @@ int cmdPatch(
     std::string const &splashBgHex,
     std::string const &outPath)
 {
-    (void)iconPath;
-    (void)splashLogoPath;
-    (void)splashBgHex;
+    (void)splashBgHex; /* SplashScreenBackground substitution is Plan 03. */
 
     ext::optional<car::Reader> reader = openReader(sourcePath);
     if (reader == ext::nullopt) {
@@ -401,12 +622,102 @@ int cmdPatch(
         return 1;
     }
 
+    /* Carry the source CARHEADER and KEYFORMAT through verbatim (Phase 243,
+     * unchanged here). */
     writer->header() = reader->header();
     writer->keyfmt() = reader->keyfmt();
 
-    reader->renditionFastIterate([&writer](void *key, size_t keyLen, void *value, size_t valueLen) {
-        writer->addRendition(key, keyLen, value, valueLen);
+    size_t identifierIndex = identifierIndexFor(reader->keyfmt());
+
+    /* Look up all three branded facets by name, as the CLI contract and
+     * Plan 03's structural symmetry require -- SplashScreenBackground's
+     * identifier is not branched on in THIS plan (it stays byte-verbatim
+     * like everything else not named AppIcon/SplashScreenLogo), but the
+     * lookup itself is unconditional so a missing branded facet on a future
+     * shell is visible during development rather than silently ignored. */
+    ext::optional<car::Facet> appIconFacet = reader->lookupFacet("AppIcon");
+    ext::optional<car::Facet> splashLogoFacet = reader->lookupFacet("SplashScreenLogo");
+    ext::optional<car::Facet> splashBgFacet = reader->lookupFacet("SplashScreenBackground");
+
+    ext::optional<uint16_t> appIconId = appIconFacet ? appIconFacet->attributes().get(car_attribute_identifier_identifier) : ext::nullopt;
+    ext::optional<uint16_t> splashLogoId = splashLogoFacet ? splashLogoFacet->attributes().get(car_attribute_identifier_identifier) : ext::nullopt;
+    ext::optional<uint16_t> splashBgId = splashBgFacet ? splashBgFacet->attributes().get(car_attribute_identifier_identifier) : ext::nullopt;
+    (void)splashBgId;
+
+    /* Decode each branded master once, up front. Never touch a SOURCE
+     * rendition's pixel data below (Pitfall A: no LZFSE/deepmap2 decode path
+     * exists on Linux) -- a decode failure here fails closed to a
+     * byte-verbatim copy of the affected renditions, never a corrupt
+     * structured write. */
+    RgbaImage iconMaster;
+    bool haveIconMaster = decodePng(iconPath, &iconMaster);
+    RgbaImage splashLogoMaster;
+    bool haveSplashLogoMaster = decodePng(splashLogoPath, &splashLogoMaster);
+
+    reader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
+        car_rendition_key *renditionKey = (car_rendition_key *)key;
+        uint16_t identifier = renditionKey[identifierIndex];
+
+        bool isAppIcon = appIconId && identifier == *appIconId;
+        bool isSplashLogo = splashLogoId && identifier == *splashLogoId;
+
+        if (!isAppIcon && !isSplashLogo) {
+            /* Byte-verbatim: every other rendition, including
+             * SplashScreenBackground (D-01/WRITER-03). */
+            writer->addRendition(key, keyLen, value, valueLen);
+            return;
+        }
+
+        /* Structured authoring path. Only header-struct fields are read
+         * from the SOURCE rendition (width/height/scale/flags/layout/
+         * metadata.name) -- never .data()/Decode() (Pitfall A). */
+        struct car_rendition_value *sourceValue = (struct car_rendition_value *)value;
+        uint32_t targetWidth = sourceValue->width;
+        uint32_t targetHeight = sourceValue->height;
+
+        RgbaImage const &master = isAppIcon ? iconMaster : splashLogoMaster;
+        bool haveMaster = isAppIcon ? haveIconMaster : haveSplashLogoMaster;
+
+        if (!haveMaster || targetWidth == 0 || targetHeight == 0) {
+            /* Fail closed: a "MultiSized Image" container entry (metadata
+             * only, no pixel payload -- width==height==0) or a missing/
+             * undecodable master both fall back to the byte-verbatim copy
+             * rather than author a corrupt structured rendition. */
+            writer->addRendition(key, keyLen, value, valueLen);
+            return;
+        }
+
+        car::AttributeList attributes = car::AttributeList::Load(
+            reader->keyfmt()->num_identifiers, reader->keyfmt()->identifier_list, renditionKey);
+
+        RgbaImage resized = resizeRgba(master, targetWidth, targetHeight);
+        std::vector<uint8_t> bgra = toPremultipliedBGRA8(resized);
+
+        car::Rendition::Data data(bgra, car::Rendition::Data::Format::PremultipliedBGRA8);
+        car::Rendition rendition = car::Rendition::Create(attributes, ext::optional<car::Rendition::Data>(data));
+
+        /* Preserve every other structural fact of the source rendition
+         * verbatim -- only its pixel content changes (D-03's "bucket set
+         * matches the shell exactly" framing). Rendition::Create() leaves
+         * these plain-enum/bool fields uninitialized; they must be set
+         * explicitly before write(). */
+        rendition.width() = static_cast<int>(targetWidth);
+        rendition.height() = static_cast<int>(targetHeight);
+        rendition.scale() = static_cast<double>(sourceValue->scale_factor) / 100.0;
+        rendition.isVector() = static_cast<bool>(sourceValue->flags.is_vector);
+        rendition.isOpaque() = isFullyOpaque(resized);
+        rendition.layout() = static_cast<enum car_rendition_value_layout>(sourceValue->metadata.layout);
+        rendition.fileName() = std::string(sourceValue->metadata.name, strnlen(sourceValue->metadata.name, sizeof(sourceValue->metadata.name)));
+
+        /* Encode()/write() emits zlib only (car_rendition_data_compression_
+         * magic_zlib) -- Rendition.cpp's Encode() has no other encode
+         * branch, so LZFSE/deepmap2 are structurally unreachable here
+         * (D-02/WRITER-03). */
+        writer->addRendition(rendition);
     });
+
+    /* Facets are unchanged -- only the branded facets' RENDITIONS values
+     * moved, never their own attributes/identifier. */
     reader->facetIterate([&writer](car::Facet const &facet) {
         writer->addFacet(facet);
     });
