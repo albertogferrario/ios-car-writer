@@ -351,6 +351,13 @@ void runPatch(
         rendition.scale() = static_cast<double>(sourceValue->scale_factor) / 100.0;
         rendition.isVector() = static_cast<bool>(sourceValue->flags.is_vector);
         rendition.isOpaque() = isFullyOpaque(resized);
+        if (isAppIcon) {
+            /* Mirrors car_roundtrip.cpp's cmdPatch() AppIcon-only override
+             * (Phase 246 Plan 01, D-01/D-02/D-03) -- see this file's header
+             * comment on why this duplication exists. */
+            rendition.bitmapDataFlags() = 0x3;
+            rendition.isOpaque() = false;
+        }
         rendition.layout() = static_cast<enum car_rendition_value_layout>(sourceValue->metadata.layout);
         rendition.fileName() = std::string(sourceValue->metadata.name, strnlen(sourceValue->metadata.name, sizeof(sourceValue->metadata.name)));
 

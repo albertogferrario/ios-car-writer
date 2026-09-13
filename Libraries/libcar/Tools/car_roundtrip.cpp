@@ -824,6 +824,16 @@ int cmdPatch(
         rendition.scale() = static_cast<double>(sourceValue->scale_factor) / 100.0;
         rendition.isVector() = static_cast<bool>(sourceValue->flags.is_vector);
         rendition.isOpaque() = isFullyOpaque(resized);
+        if (isAppIcon) {
+            /* ITMS-90717 fix (D-01/D-02, spike 246-S03): actool marks the
+             * App Store icon's CELM data-header container opaque (flags
+             * 0x3), independent of the ARGB pixel format underneath -- this
+             * is Apple's actual discriminator. Scoped to AppIcon only
+             * (D-03): applying it to SplashScreenLogo would destroy its
+             * legitimate transparency. */
+            rendition.bitmapDataFlags() = 0x3;
+            rendition.isOpaque() = false;
+        }
         rendition.layout() = static_cast<enum car_rendition_value_layout>(sourceValue->metadata.layout);
         rendition.fileName() = std::string(sourceValue->metadata.name, strnlen(sourceValue->metadata.name, sizeof(sourceValue->metadata.name)));
 

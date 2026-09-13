@@ -81,6 +81,7 @@ Rendition(AttributeList const &attributes, std::function<ext::optional<Data>(Ren
     _scale       (1.0),
     _isVector    (false),
     _isOpaque    (false),
+    _bitmapDataFlags(0),
     _isResizable (false)
 {
 }
@@ -94,6 +95,7 @@ Rendition(AttributeList const &attributes, ext::optional<Data> const &data) :
     _scale      (1.0),
     _isVector   (false),
     _isOpaque   (false),
+    _bitmapDataFlags(0),
     _isResizable(false)
 {
 }
@@ -501,6 +503,8 @@ Encode(Rendition const *rendition, ext::optional<Rendition::Data> data)
     memcpy(header1->magic, "MLEC", sizeof(header1->magic));
     header1->length = compressed_vector.size();
     header1->compression = compression_magic;
+    header1->flags.unknown1 = rendition->bitmapDataFlags() & 0x1;
+    header1->flags.unknown2 = (rendition->bitmapDataFlags() >> 1) & 0x1;
     output.insert(output.end(), compressed_vector.begin(), compressed_vector.end());
 
     return output;

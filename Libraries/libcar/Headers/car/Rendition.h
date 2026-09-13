@@ -116,6 +116,7 @@ private:
     double                          _scale;
     bool                            _isVector;
     bool                            _isOpaque;
+    uint32_t                        _bitmapDataFlags;
     bool                            _isResizable;
     ResizeMode                      _resizeMode;
     std::vector<Slice>              _slices;
@@ -191,6 +192,17 @@ public:
     { return _isOpaque; }
     bool &isOpaque()
     { return _isOpaque; }
+
+    /*
+     * The CELM data-header (car_rendition_data_header1) low flags bits
+     * Encode() writes for this rendition's compressed-data container.
+     * Default 0 preserves byte-identical output; the AppIcon-only override
+     * (0x3, the opaque container marker actool uses) lives in cmdPatch().
+     */
+    uint32_t bitmapDataFlags() const
+    { return _bitmapDataFlags; }
+    uint32_t &bitmapDataFlags()
+    { return _bitmapDataFlags; }
 
     /*
      * layout
