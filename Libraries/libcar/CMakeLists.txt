@@ -29,7 +29,7 @@ if ("${COMPRESSION}" STREQUAL "COMPRESSION-NOTFOUND")
   set(COMPRESSION "")
 endif ()
 
-target_link_libraries(car PUBLIC ext bom ${COMPRESSION})
+target_link_libraries(car PUBLIC ext bom lzfse ${COMPRESSION})
 target_include_directories(car PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Headers")
 install(TARGETS car DESTINATION usr/lib)
 

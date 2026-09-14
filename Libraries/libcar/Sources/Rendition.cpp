@@ -13,8 +13,10 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 #include <zlib.h>
+#include <lzfse.h>
 
 #if defined(__APPLE__)
 #include <Availability.h>
@@ -82,6 +84,7 @@ Rendition(AttributeList const &attributes, std::function<ext::optional<Data>(Ren
     _isVector    (false),
     _isOpaque    (false),
     _bitmapDataFlags(0),
+    _compressionPreference(car_rendition_data_compression_magic_zlib),
     _isResizable (false)
 {
 }
@@ -96,6 +99,7 @@ Rendition(AttributeList const &attributes, ext::optional<Data> const &data) :
     _isVector   (false),
     _isOpaque   (false),
     _bitmapDataFlags(0),
+    _compressionPreference(car_rendition_data_compression_magic_zlib),
     _isResizable(false)
 {
 }
@@ -451,14 +455,21 @@ Encode(Rendition const *rendition, ext::optional<Rendition::Data> data)
         return data->data();
     }
 
-    /* The selected algorithm, only zlib for now. */
-    enum car_rendition_data_compression_magic compression_magic = car_rendition_data_compression_magic_zlib;
+    /* The codec is a settable per-rendition preference (default zlib); the
+     * caller selects lzfse for the AppIcon only. Never name-sniffed here. */
+    enum car_rendition_data_compression_magic compression_magic = rendition->compressionPreference();
     size_t bytes_per_pixel = Rendition::Data::FormatSize(data->format());
 
     size_t uncompressed_length = rendition->width() * rendition->height() * bytes_per_pixel;
     void *uncompressed_data = static_cast<void *>(data->data().data());
 
+    /* Bytes that follow header1: the zlib deflate stream, or the concatenated
+     * KCBC blocks (header2 + lzfse frame, repeated) for lzfse. */
     std::vector<uint8_t> compressed_vector;
+    /* car_rendition_data_header1.length: the deflate-stream length for zlib,
+     * but a constant marker of 4 for lzfse -- the decoder ignores it there and
+     * reads each KCBC block's own length (246-KCBC-FRAMING-SPEC.md). */
+    uint32_t header1_length_field = 0;
     if (compression_magic == car_rendition_data_compression_magic_zlib) {
         z_stream zlibStream;
         memset(&zlibStream, 0, sizeof(zlibStream));
@@ -495,13 +506,66 @@ Encode(Rendition const *rendition, ext::optional<Rendition::Data> data)
         if (compressed_vector.size() > 9) {
             compressed_vector[9] = 0;
         }
+
+        header1_length_field = static_cast<uint32_t>(compressed_vector.size());
+    } else if (compression_magic == car_rendition_data_compression_magic_jpeg_lzfse) {
+        /*
+         * lzfse + KCBC block framing (246-KCBC-FRAMING-SPEC.md), the codec
+         * actool uses for the App Store marketing icon. Split the raw
+         * premultiplied-BGRA8 buffer into page-aligned blocks of 341*4096
+         * bytes (the final block is the remainder), lzfse-encode each block
+         * into its own standalone frame, and emit one KCBC block header per
+         * frame. header1.length is the constant marker 4, not the data length.
+         */
+        header1_length_field = 4;
+
+        const size_t kBlockSize = static_cast<size_t>(341) * 4096; /* 1,396,736 */
+        uint8_t const *src = static_cast<uint8_t const *>(uncompressed_data);
+
+        std::vector<uint8_t> scratch(lzfse_encode_scratch_size());
+
+        size_t offset = 0;
+        while (offset < uncompressed_length) {
+            size_t blockLen = std::min(kBlockSize, uncompressed_length - offset);
+            /* unknown3 = block-uncompressed-bytes / 4096 (page count). Block
+             * lengths are 4096-multiples for the 1024x1024 icon; ceil covers
+             * any hypothetical partial final page (246-KCBC-FRAMING-SPEC.md). */
+            uint32_t pages = static_cast<uint32_t>((blockLen + 4095) / 4096);
+
+            /* lzfse's worst-case output is bounded a little above the input:
+             * an incompressible block falls back to an uncompressed frame. */
+            std::vector<uint8_t> frame(blockLen + 4096);
+            size_t frameLen = lzfse_encode_buffer(
+                frame.data(), frame.size(), src + offset, blockLen, scratch.data());
+            if (frameLen == 0) {
+                fprintf(stderr, "error: lzfse encode failed\n");
+                return ext::nullopt;
+            }
+
+            struct car_rendition_data_header2 blockHeader;
+            memset(&blockHeader, 0, sizeof(blockHeader));
+            memcpy(blockHeader.magic, "KCBC", sizeof(blockHeader.magic));
+            blockHeader.unknown1 = 0;
+            blockHeader.unknown2 = 0;
+            blockHeader.unknown3 = pages;
+            blockHeader.length = static_cast<uint32_t>(frameLen);
+
+            uint8_t const *headerBytes = reinterpret_cast<uint8_t const *>(&blockHeader);
+            compressed_vector.insert(compressed_vector.end(), headerBytes, headerBytes + sizeof(blockHeader));
+            compressed_vector.insert(compressed_vector.end(), frame.begin(), frame.begin() + frameLen);
+
+            offset += blockLen;
+        }
+    } else {
+        fprintf(stderr, "error: no encoder for compression magic %x\n", compression_magic);
+        return ext::nullopt;
     }
 
     std::vector<uint8_t> output = std::vector<uint8_t>(sizeof(struct car_rendition_data_header1));
 
     struct car_rendition_data_header1 *header1 = reinterpret_cast<struct car_rendition_data_header1 *>(output.data());
     memcpy(header1->magic, "MLEC", sizeof(header1->magic));
-    header1->length = compressed_vector.size();
+    header1->length = header1_length_field;
     header1->compression = compression_magic;
     header1->flags.unknown1 = rendition->bitmapDataFlags() & 0x1;
     header1->flags.unknown2 = (rendition->bitmapDataFlags() >> 1) & 0x1;

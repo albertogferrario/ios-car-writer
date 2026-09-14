@@ -833,14 +833,20 @@ int cmdPatch(
              * legitimate transparency. */
             rendition.bitmapDataFlags() = 0x3;
             rendition.isOpaque() = false;
+            /* The App Store marketing icon must be lzfse+KCBC (compression=4),
+             * the codec actool uses -- Apple's server ingests a zlib splash but
+             * stalls silently on a zlib 1024x1024 AppIcon (build 189 hung,
+             * build 193 with a stock-lzfse AppIcon went VALID). WRITER-04 /
+             * CONTEXT D-10; scoped to AppIcon only. */
+            rendition.compressionPreference() = car_rendition_data_compression_magic_jpeg_lzfse;
         }
         rendition.layout() = static_cast<enum car_rendition_value_layout>(sourceValue->metadata.layout);
         rendition.fileName() = std::string(sourceValue->metadata.name, strnlen(sourceValue->metadata.name, sizeof(sourceValue->metadata.name)));
 
-        /* Encode()/write() emits zlib only (car_rendition_data_compression_
-         * magic_zlib) -- Rendition.cpp's Encode() has no other encode
-         * branch, so LZFSE/deepmap2 are structurally unreachable here
-         * (D-02/WRITER-03). */
+        /* Encode()/write() emits the AppIcon as lzfse wrapped in Apple's KCBC
+         * block framing (compression=4, via the AppIcon-only compression
+         * preference set above); the SplashScreenLogo and every other rendition
+         * keep the default zlib codec (D-03/WRITER-04). */
         writer->addRendition(rendition);
     });
 

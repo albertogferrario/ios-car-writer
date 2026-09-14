@@ -117,6 +117,7 @@ private:
     bool                            _isVector;
     bool                            _isOpaque;
     uint32_t                        _bitmapDataFlags;
+    enum car_rendition_data_compression_magic _compressionPreference;
     bool                            _isResizable;
     ResizeMode                      _resizeMode;
     std::vector<Slice>              _slices;
@@ -203,6 +204,19 @@ public:
     { return _bitmapDataFlags; }
     uint32_t &bitmapDataFlags()
     { return _bitmapDataFlags; }
+
+    /*
+     * The compressed-data codec Encode() writes for this rendition
+     * (car_rendition_data_header1.compression). Default zlib preserves
+     * byte-identical output for every rendition; the AppIcon-only override to
+     * jpeg_lzfse (lzfse+KCBC framing, the codec actool uses for the App Store
+     * marketing icon) lives in cmdPatch(). Never name-sniffed -- the caller
+     * sets it explicitly.
+     */
+    enum car_rendition_data_compression_magic compressionPreference() const
+    { return _compressionPreference; }
+    enum car_rendition_data_compression_magic &compressionPreference()
+    { return _compressionPreference; }
 
     /*
      * layout

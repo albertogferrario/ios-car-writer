@@ -9,4 +9,5 @@
 add_subdirectory(ext)
 add_subdirectory(libutil)
 add_subdirectory(libbom)
+add_subdirectory(lzfse)
 add_subdirectory(libcar)

@@ -28,6 +28,8 @@
 #include <car/VariablePassthrough.h>
 #include <bom/bom.h>
 
+#include <lzfse.h>
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -230,15 +232,17 @@ bool patchSplashScreenBackgroundValue(void const *sourceValue, size_t sourceValu
 
 /*
  * Mirrors car_roundtrip.cpp's cmdPatch() exactly (identifier-partition,
- * byte-verbatim default arm, structured zlib authoring for AppIcon/
+ * byte-verbatim default arm, structured MLEC authoring for AppIcon/
  * SplashScreenLogo, raw byte-template patch for SplashScreenBackground).
+ * The two structured facets carry different codecs -- the AppIcon is lzfse+KCBC
+ * (compression=4), the SplashScreenLogo stays zlib (compression=2).
  * Collects the hex-key of every AppIcon/SplashScreenLogo rendition (the ones
- * that went through the structured zlib-authoring branch) into
- * *zlibBrandedKeys, and every branded key including SplashScreenBackground
+ * that went through the structured MLEC-authoring branch) into
+ * *structuredBrandedKeys, and every branded key including SplashScreenBackground
  * into *allBrandedKeys -- kept as two separate sets because
  * SplashScreenBackground's raw byte-template patch does not produce an MLEC
- * zlib header the way the other two do (BrandedRenditionsAreZlibCompressed...
- * below only checks zlibBrandedKeys; the byte-identity test below checks
+ * header at all the way the other two do (AppIconIsLzfseKcbcSplashLogoStaysZlib
+ * below only checks structuredBrandedKeys; the byte-identity test below checks
  * allBrandedKeys).
  */
 void runPatch(
@@ -247,7 +251,7 @@ void runPatch(
     RgbaImage const &splashLogoMaster,
     std::string const &splashBgHex,
     std::string const &outputPath,
-    std::set<std::string> *zlibBrandedKeys,
+    std::set<std::string> *structuredBrandedKeys,
     std::set<std::string> *allBrandedKeys,
     std::set<std::string> *appIconKeys,
     std::set<std::string> *splashLogoKeys)
@@ -353,17 +357,20 @@ void runPatch(
         rendition.isOpaque() = isFullyOpaque(resized);
         if (isAppIcon) {
             /* Mirrors car_roundtrip.cpp's cmdPatch() AppIcon-only override
-             * (Phase 246 Plan 01, D-01/D-02/D-03) -- see this file's header
-             * comment on why this duplication exists. */
+             * (Phase 246 Plan 01 D-01/D-02/D-03, Plan 06 WRITER-04/D-10) --
+             * see this file's header comment on why this duplication exists.
+             * The opaque CELM container flags plus the lzfse+KCBC codec are
+             * both scoped to AppIcon; the SplashScreenLogo keeps zlib. */
             rendition.bitmapDataFlags() = 0x3;
             rendition.isOpaque() = false;
+            rendition.compressionPreference() = car_rendition_data_compression_magic_jpeg_lzfse;
         }
         rendition.layout() = static_cast<enum car_rendition_value_layout>(sourceValue->metadata.layout);
         rendition.fileName() = std::string(sourceValue->metadata.name, strnlen(sourceValue->metadata.name, sizeof(sourceValue->metadata.name)));
 
         writer->addRendition(rendition);
         std::string hexKey = car::bytesToHex(key, keyLen);
-        zlibBrandedKeys->insert(hexKey);
+        structuredBrandedKeys->insert(hexKey);
         allBrandedKeys->insert(hexKey);
         if (isAppIcon) {
             appIconKeys->insert(hexKey);
@@ -384,10 +391,10 @@ void runPatch(
 struct PatchResult {
     ext::optional<Reader> sourceReader;
     ext::optional<Reader> outReader;
-    std::set<std::string> zlibBrandedKeys; /* AppIcon + SplashScreenLogo only. */
-    std::set<std::string> allBrandedKeys;  /* zlibBrandedKeys + SplashScreenBackground. */
-    std::set<std::string> appIconKeys;     /* Structured-authoring AppIcon buckets only. */
-    std::set<std::string> splashLogoKeys;  /* Structured-authoring SplashScreenLogo buckets only. */
+    std::set<std::string> structuredBrandedKeys; /* MLEC-authored: AppIcon (lzfse) + SplashScreenLogo (zlib). */
+    std::set<std::string> allBrandedKeys;  /* structuredBrandedKeys + SplashScreenBackground. */
+    std::set<std::string> appIconKeys;     /* Structured-authoring AppIcon buckets only (lzfse+KCBC). */
+    std::set<std::string> splashLogoKeys;  /* Structured-authoring SplashScreenLogo buckets only (zlib). */
 };
 
 /*
@@ -419,7 +426,7 @@ PatchResult patchRealShellFixture(std::string const &outputPath, std::string con
 
     RgbaImage iconMaster = makeSolidImage(1024, 1024, 10, 20, 30, 255);
     RgbaImage splashLogoMaster = makeSolidImage(64, 64, 200, 100, 50, 128);
-    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.zlibBrandedKeys, &result.allBrandedKeys, &result.appIconKeys, &result.splashLogoKeys);
+    runPatch(*sourceReader, iconMaster, splashLogoMaster, splashBgHex, outputPath, &result.structuredBrandedKeys, &result.allBrandedKeys, &result.appIconKeys, &result.splashLogoKeys);
 
     struct bom_context_memory sourceMemory2 = bom_context_memory_file(fixturePath.c_str(), false, 0);
     if (sourceMemory2.data == nullptr) {
@@ -485,6 +492,54 @@ bool findRenditionValueByFacetName(Reader const &reader, std::string const &face
     return found;
 }
 
+/*
+ * One KCBC block of an lzfse-framed rendition: its page count (unknown3), the
+ * compressed lzfse frame length, and a pointer to the frame bytes (which live
+ * inside the reopened out-reader's own mmap, valid for the test's lifetime).
+ */
+struct KcbcBlock {
+    uint32_t unknown3;
+    uint32_t length;
+    uint8_t const *frame;
+};
+
+/*
+ * Walk the header1 + KCBC blocks of a rendition value straight off its raw
+ * bytes -- the self-contained Linux ground-truth for the lzfse+KCBC framing
+ * (assetutil is macOS-only and is not a CI dependency). Returns false if the
+ * MLEC header is malformed, a block's KCBC magic is wrong, or the blocks do
+ * not consume exactly bitmaps.payload_size bytes.
+ */
+bool walkRenditionData(void *value, uint32_t *outCompression, uint32_t *outHeader1Length, std::vector<KcbcBlock> *outBlocks)
+{
+    struct car_rendition_value *renditionValue = (struct car_rendition_value *)value;
+    struct car_rendition_data_header1 *header1 = (struct car_rendition_data_header1 *)(
+        (uintptr_t)renditionValue + sizeof(struct car_rendition_value) + renditionValue->info_len);
+    if (std::string(header1->magic, 4) != "MLEC") {
+        return false;
+    }
+    *outCompression = header1->compression;
+    *outHeader1Length = header1->length;
+
+    uint8_t const *payloadStart = reinterpret_cast<uint8_t const *>(header1);
+    uint8_t const *payloadEnd = payloadStart + renditionValue->bitmaps.payload_size;
+    uint8_t const *cursor = payloadStart + sizeof(struct car_rendition_data_header1);
+
+    while (cursor + sizeof(struct car_rendition_data_header2) <= payloadEnd) {
+        struct car_rendition_data_header2 const *blockHeader = (struct car_rendition_data_header2 const *)cursor;
+        if (strncmp(blockHeader->magic, "KCBC", 4) != 0) {
+            return false;
+        }
+        KcbcBlock block;
+        block.unknown3 = blockHeader->unknown3;
+        block.length = blockHeader->length;
+        block.frame = cursor + sizeof(struct car_rendition_data_header2);
+        outBlocks->push_back(block);
+        cursor = block.frame + blockHeader->length;
+    }
+    return cursor == payloadEnd;
+}
+
 } // namespace
 
 TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
@@ -493,15 +548,15 @@ TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
     ASSERT_NE(result.sourceReader, ext::nullopt) << "shell fixture not found or unreadable, or patch setup failed";
     ASSERT_NE(result.outReader, ext::nullopt);
     /* Branded keys span 3 facets: AppIcon, SplashScreenLogo (structured
-     * zlib authoring, one key per scale/idiom bucket), SplashScreenBackground
+     * MLEC authoring, one key per scale/idiom bucket), SplashScreenBackground
      * (raw byte-template patch, always exactly one "universal" key). Widened
      * from the 2-facet exclusion 244-02 established, now that
      * SplashScreenBackground is also branded (Phase 244 Plan 03) -- the
      * exact key COUNT depends on how many buckets the fixture's AppIcon/
      * SplashScreenLogo facets carry, so this asserts the superset
      * relationship rather than a specific magic number. */
-    ASSERT_GT(result.allBrandedKeys.size(), result.zlibBrandedKeys.size()) << "SplashScreenBackground's own key must have been added on top of the zlib-branded keys";
-    ASSERT_GT(result.zlibBrandedKeys.size(), static_cast<size_t>(0)) << "no rendition was branded -- fixture shape assumption wrong";
+    ASSERT_GT(result.allBrandedKeys.size(), result.structuredBrandedKeys.size()) << "SplashScreenBackground's own key must have been added on top of the structured-authoring keys";
+    ASSERT_GT(result.structuredBrandedKeys.size(), static_cast<size_t>(0)) << "no rendition was branded -- fixture shape assumption wrong";
 
     std::map<std::string, std::string> sourceHashes;
     result.sourceReader->renditionFastIterate([&sourceHashes](void *key, size_t keyLen, void *value, size_t valueLen) {
@@ -526,41 +581,56 @@ TEST(Patch, UntouchedRenditionsRemainByteIdenticalExceptBrandedKeys)
     std::remove("real_shell_patch_output_bytes.car");
 }
 
-TEST(Patch, BrandedRenditionsAreZlibCompressedNotLzfseOrDeepmap2)
+/*
+ * Root-cause fix anchor (Phase 246 Plan 06, WRITER-04/D-10): the App Store
+ * marketing icon must be lzfse wrapped in Apple's KCBC block framing
+ * (compression=4, header1.length marker 4) -- Apple's server ingests a zlib
+ * SplashScreenLogo but stalls silently on a zlib 1024x1024 AppIcon (build 189
+ * hung, build 193 with a stock-lzfse AppIcon went VALID). The codec split is
+ * scoped: AppIcon lzfse, SplashScreenLogo stays zlib (compression=2).
+ */
+TEST(Patch, AppIconIsLzfseKcbcSplashLogoStaysZlib)
 {
-    PatchResult result = patchRealShellFixture("real_shell_patch_output_zlib.car", kSplashBgNavyHex);
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_codec.car", kSplashBgNavyHex);
     ASSERT_NE(result.outReader, ext::nullopt);
-    /* AppIcon + SplashScreenLogo buckets only -- SplashScreenBackground's
-     * raw byte-template patch has no MLEC/zlib header at all, so it must
-     * not be included here (it is covered separately by
-     * SplashScreenBackgroundIsRecoloredFromHexTemplate below). */
-    ASSERT_GT(result.zlibBrandedKeys.size(), static_cast<size_t>(0));
+    ASSERT_GT(result.appIconKeys.size(), static_cast<size_t>(0)) << "no AppIcon rendition went through structured authoring";
+    ASSERT_GT(result.splashLogoKeys.size(), static_cast<size_t>(0)) << "no SplashScreenLogo rendition went through structured authoring";
 
-    size_t checked = 0;
+    size_t checkedAppIcon = 0;
+    size_t checkedSplashLogo = 0;
     result.outReader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
         (void)valueLen;
         std::string hexKey = car::bytesToHex(key, keyLen);
-        if (result.zlibBrandedKeys.find(hexKey) == result.zlibBrandedKeys.end()) {
+        bool isAppIconKey = result.appIconKeys.find(hexKey) != result.appIconKeys.end();
+        bool isSplashLogoKey = result.splashLogoKeys.find(hexKey) != result.splashLogoKeys.end();
+        if (!isAppIconKey && !isSplashLogoKey) {
             return;
         }
-        checked++;
 
         struct car_rendition_value *renditionValue = (struct car_rendition_value *)value;
         struct car_rendition_data_header1 *header1 = (struct car_rendition_data_header1 *)(
             (uintptr_t)renditionValue + sizeof(struct car_rendition_value) + renditionValue->info_len);
 
         EXPECT_EQ(std::string(header1->magic, 4), "MLEC") << "branded rendition " << hexKey << " has a malformed data header";
-        EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_zlib))
-            << "branded rendition " << hexKey << " is not zlib-compressed";
-        EXPECT_NE(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_lzvn))
-            << "branded rendition " << hexKey << " unexpectedly uses LZVN";
-        EXPECT_NE(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_jpeg_lzfse))
-            << "branded rendition " << hexKey << " unexpectedly uses LZFSE";
+        if (isAppIconKey) {
+            checkedAppIcon++;
+            EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_jpeg_lzfse))
+                << "AppIcon rendition " << hexKey << " must be lzfse-compressed (compression=4)";
+            EXPECT_EQ(header1->length, static_cast<uint32_t>(4))
+                << "AppIcon rendition " << hexKey << " header1.length must be the KCBC marker 4, not the data length";
+        } else {
+            checkedSplashLogo++;
+            EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_zlib))
+                << "SplashScreenLogo rendition " << hexKey << " must stay zlib-compressed (compression=2)";
+            EXPECT_NE(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_jpeg_lzfse))
+                << "SplashScreenLogo rendition " << hexKey << " must not use LZFSE -- the AppIcon-only codec must not leak onto it";
+        }
     });
 
-    EXPECT_EQ(checked, result.zlibBrandedKeys.size()) << "not every branded key was found during the output iteration";
+    EXPECT_EQ(checkedAppIcon, result.appIconKeys.size()) << "not every AppIcon key was found during the output iteration";
+    EXPECT_EQ(checkedSplashLogo, result.splashLogoKeys.size()) << "not every SplashScreenLogo key was found during the output iteration";
 
-    std::remove("real_shell_patch_output_zlib.car");
+    std::remove("real_shell_patch_output_codec.car");
 }
 
 /*
@@ -595,15 +665,17 @@ TEST(Patch, AppIconRenditionCarriesOpaqueCelmFlagsSplashLogoDoesNot)
             (uintptr_t)renditionValue + sizeof(struct car_rendition_value) + renditionValue->info_len);
 
         EXPECT_EQ(std::string(header1->magic, 4), "MLEC") << "rendition " << hexKey << " has a malformed data header";
-        EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_zlib))
-            << "rendition " << hexKey << " is not zlib-compressed";
 
         uint32_t flags = header1->flags.unknown1 | (header1->flags.unknown2 << 1);
         if (isAppIconKey) {
             checkedAppIcon++;
+            EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_jpeg_lzfse))
+                << "AppIcon rendition " << hexKey << " must be lzfse-compressed (compression=4)";
             EXPECT_EQ(flags, static_cast<uint32_t>(0x3)) << "AppIcon rendition " << hexKey << " must carry the opaque CELM container flags 0x3";
         } else {
             checkedSplashLogo++;
+            EXPECT_EQ(header1->compression, static_cast<uint32_t>(car_rendition_data_compression_magic_zlib))
+                << "SplashScreenLogo rendition " << hexKey << " must stay zlib-compressed (compression=2)";
             EXPECT_EQ(flags, static_cast<uint32_t>(0x0)) << "SplashScreenLogo rendition " << hexKey << " must keep flags 0x0 -- the AppIcon-only fix must not leak onto it";
         }
     });
@@ -612,6 +684,124 @@ TEST(Patch, AppIconRenditionCarriesOpaqueCelmFlagsSplashLogoDoesNot)
     EXPECT_EQ(checkedSplashLogo, result.splashLogoKeys.size()) << "not every SplashScreenLogo key was found during the output iteration";
 
     std::remove("real_shell_patch_output_celm_flags.car");
+}
+
+/*
+ * Structural ground-truth for the lzfse+KCBC framing (246-KCBC-FRAMING-SPEC.md).
+ * The shell fixture's two pixel-carrying AppIcon renditions are 1024x1024
+ * (4,194,304 B = 1024 pages): three full 341-page blocks (341*4096 =
+ * 1,396,736 B) plus a 1-page remainder block, four KCBC blocks in all. This
+ * asserts the exact framing off the raw bytes -- assetutil is macOS-only and
+ * is not a CI dependency, so this is the decisive Linux check.
+ */
+TEST(Patch, AppIconLzfseKcbcFramingMatchesSpec)
+{
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_framing.car", kSplashBgNavyHex);
+    ASSERT_NE(result.outReader, ext::nullopt);
+    ASSERT_GT(result.appIconKeys.size(), static_cast<size_t>(0)) << "no AppIcon rendition went through structured authoring";
+
+    size_t checkedAppIcon = 0;
+    result.outReader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
+        (void)valueLen;
+        std::string hexKey = car::bytesToHex(key, keyLen);
+        if (result.appIconKeys.find(hexKey) == result.appIconKeys.end()) {
+            return;
+        }
+        checkedAppIcon++;
+
+        struct car_rendition_value *renditionValue = (struct car_rendition_value *)value;
+        EXPECT_EQ(renditionValue->width, static_cast<uint32_t>(1024)) << "fixture AppIcon rendition " << hexKey << " is not 1024 wide";
+        EXPECT_EQ(renditionValue->height, static_cast<uint32_t>(1024)) << "fixture AppIcon rendition " << hexKey << " is not 1024 tall";
+
+        uint32_t compression = 0;
+        uint32_t header1Length = 0;
+        std::vector<KcbcBlock> blocks;
+        ASSERT_TRUE(walkRenditionData(value, &compression, &header1Length, &blocks))
+            << "AppIcon rendition " << hexKey << " KCBC framing did not consume exactly bitmaps.payload_size";
+
+        EXPECT_EQ(compression, static_cast<uint32_t>(car_rendition_data_compression_magic_jpeg_lzfse));
+        EXPECT_EQ(header1Length, static_cast<uint32_t>(4)) << "header1.length must be the constant marker 4";
+
+        ASSERT_EQ(blocks.size(), static_cast<size_t>(4)) << "a 1024x1024 icon must produce exactly 4 KCBC blocks";
+        uint32_t const expectedPages[4] = {341, 341, 341, 1};
+        for (size_t i = 0; i < 4; i++) {
+            EXPECT_EQ(blocks[i].unknown3, expectedPages[i]) << "block " << i << " page count (unknown3) mismatch";
+            EXPECT_GT(blocks[i].length, static_cast<uint32_t>(0)) << "block " << i << " has an empty lzfse frame";
+        }
+    });
+
+    EXPECT_EQ(checkedAppIcon, result.appIconKeys.size()) << "not every AppIcon key was found during the output iteration";
+
+    std::remove("real_shell_patch_output_framing.car");
+}
+
+/*
+ * Encoder correctness without assetutil: decode every emitted AppIcon KCBC
+ * frame with the vendored lzfse and prove the reassembled buffer is the
+ * page-aligned premultiplied-BGRA8 the encoder was fed (the resized opaque
+ * icon master). This closes the loop the macOS-only decode path cannot on
+ * Linux.
+ */
+TEST(Patch, AppIconLzfseFramesDecodeToExpectedBuffer)
+{
+    PatchResult result = patchRealShellFixture("real_shell_patch_output_decode.car", kSplashBgNavyHex);
+    ASSERT_NE(result.outReader, ext::nullopt);
+    ASSERT_GT(result.appIconKeys.size(), static_cast<size_t>(0)) << "no AppIcon rendition went through structured authoring";
+
+    /* Same master patchRealShellFixture feeds the AppIcon branch. */
+    RgbaImage iconMaster = makeSolidImage(1024, 1024, 10, 20, 30, 255);
+    std::vector<uint8_t> decodeScratch(lzfse_decode_scratch_size());
+
+    size_t checkedAppIcon = 0;
+    result.outReader->renditionFastIterate([&](void *key, size_t keyLen, void *value, size_t valueLen) {
+        (void)valueLen;
+        std::string hexKey = car::bytesToHex(key, keyLen);
+        if (result.appIconKeys.find(hexKey) == result.appIconKeys.end()) {
+            return;
+        }
+        checkedAppIcon++;
+
+        struct car_rendition_value *renditionValue = (struct car_rendition_value *)value;
+        uint32_t width = renditionValue->width;
+        uint32_t height = renditionValue->height;
+
+        uint32_t compression = 0;
+        uint32_t header1Length = 0;
+        std::vector<KcbcBlock> blocks;
+        ASSERT_TRUE(walkRenditionData(value, &compression, &header1Length, &blocks))
+            << "AppIcon rendition " << hexKey << " KCBC framing malformed";
+
+        std::vector<uint8_t> reassembled;
+        for (size_t i = 0; i < blocks.size(); i++) {
+            size_t blockUncompressedLen = static_cast<size_t>(blocks[i].unknown3) * 4096;
+            std::vector<uint8_t> decoded(blockUncompressedLen);
+            size_t decodedLen = lzfse_decode_buffer(
+                decoded.data(), decoded.size(), blocks[i].frame, blocks[i].length, decodeScratch.data());
+            ASSERT_EQ(decodedLen, blockUncompressedLen) << "block " << i << " of " << hexKey << " did not decode to its full page-aligned length";
+            reassembled.insert(reassembled.end(), decoded.begin(), decoded.end());
+        }
+
+        /* The encoder was fed toPremultipliedBGRA8(resizeRgba(master, w, h)). */
+        RgbaImage resized = resizeRgba(iconMaster, width, height);
+        std::vector<uint8_t> expected = toPremultipliedBGRA8(resized);
+
+        ASSERT_EQ(reassembled.size(), expected.size()) << "reassembled length for " << hexKey << " != w*h*4";
+        EXPECT_EQ(reassembled, expected) << "decoded AppIcon pixels for " << hexKey << " do not match the premultiplied-BGRA8 master";
+
+        /* Opaque: every alpha byte is 0xFF (the master is fully opaque). */
+        bool allOpaque = true;
+        for (size_t i = 3; i < reassembled.size(); i += 4) {
+            if (reassembled[i] != 0xFF) {
+                allOpaque = false;
+                break;
+            }
+        }
+        EXPECT_TRUE(allOpaque) << "decoded AppIcon " << hexKey << " has non-opaque alpha";
+    });
+
+    EXPECT_EQ(checkedAppIcon, result.appIconKeys.size()) << "not every AppIcon key was found during the output iteration";
+
+    std::remove("real_shell_patch_output_decode.car");
 }
 
 TEST(Patch, OutputHeaderAndKeyformatMatchSourceExactly)
